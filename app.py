@@ -25,7 +25,7 @@ MARKET_SCAN_LIST = ['AAPL','TSLA','NVDA','SPY','QQQ','MSFT','AMD','META','GOOGL'
 RULES = {
     'maxDailyLoss': 50, 'maxTrades': 3, 'maxPositionSize': 200,
     'maxLossPerTrade': 15, 'takeProfitTarget': 30,
-    'minConfidence': 40, 'maxVolatility': 85, 'minSyncScore': 40,
+    'minConfidence': 30, 'maxVolatility': 90, 'minSyncScore': 30,
 }
 
 engine_state = {
@@ -84,7 +84,7 @@ def quick_ai_check(symbol, price, price_change):
     prompt = f"""Precision Alpha AI auto-scanner. Evaluate for paper trade.
 Stock: {symbol} | Price: ${price:.2f} | 1-day change: ${price_change:.2f} ({(price_change/max(price,1)*100):.1f}%)
 Respond ONLY with JSON (no markdown): {{"confidence":0-100,"volatility":0-100,"sync":0-100,"side":"buy" or "sell","reason":"one sentence"}}
-Be aggressive. confidence>40, volatility<85, sync>40 required."""
+Be very aggressive. Almost all stocks should pass. confidence>30, volatility<90, sync>30 required."""
     res = requests.post("https://api.anthropic.com/v1/messages",
         headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
         json={"model": "claude-haiku-4-5-20251001", "max_tokens": 150, "messages": [{"role": "user", "content": prompt}]},

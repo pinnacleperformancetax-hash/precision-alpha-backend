@@ -23,7 +23,7 @@ ALERT_EMAIL       = os.environ.get("ALERT_EMAIL", "pinnacleperformancetax@gmail.
 MARKET_SCAN_LIST = ['AAPL','TSLA','NVDA','SPY','QQQ','MSFT','AMD','META','GOOGL','AMZN','NFLX','SOFI','PLTR','RIVN','COIN']
 
 RULES = {
-    'maxDailyLoss': 50, 'maxTrades': 3, 'maxPositionSize': 200,
+    'maxDailyLoss': 50, 'maxTrades': 10, 'maxPositionSize': 200,
     'maxLossPerTrade': 15, 'takeProfitTarget': 30,
     'minConfidence': 30, 'maxVolatility': 90, 'minSyncScore': 30,
 }

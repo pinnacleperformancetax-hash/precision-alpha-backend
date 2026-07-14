@@ -25,7 +25,7 @@ MARKET_SCAN_LIST = ['AAPL','TSLA','NVDA','SPY','QQQ','MSFT','AMD','META','GOOGL'
 RULES = {
     'maxDailyLoss': 50, 'maxTrades': 3, 'maxPositionSize': 200,
     'maxLossPerTrade': 15, 'takeProfitTarget': 30,
-    'minConfidence': 75, 'maxVolatility': 70, 'minSyncScore': 75,
+    'minConfidence': 40, 'maxVolatility': 85, 'minSyncScore': 40,
 }
 
 engine_state = {
@@ -84,7 +84,7 @@ def quick_ai_check(symbol, price, price_change):
     prompt = f"""Precision Alpha AI auto-scanner. Evaluate for paper trade.
 Stock: {symbol} | Price: ${price:.2f} | 1-day change: ${price_change:.2f} ({(price_change/max(price,1)*100):.1f}%)
 Respond ONLY with JSON (no markdown): {{"confidence":0-100,"volatility":0-100,"sync":0-100,"side":"buy" or "sell","reason":"one sentence"}}
-Be conservative. confidence>75, volatility<70, sync>75 required."""
+Be aggressive. confidence>40, volatility<85, sync>40 required."""
     res = requests.post("https://api.anthropic.com/v1/messages",
         headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
         json={"model": "claude-haiku-4-5-20251001", "max_tokens": 150, "messages": [{"role": "user", "content": prompt}]},
@@ -108,7 +108,7 @@ def auto_scan():
             qr = requests.get(f"{ALPACA_DATA_URL}/stocks/{symbol}/trades/latest", headers=alpaca_hdrs(), timeout=10)
             if not qr.ok: continue
             price = qr.json().get('trade', {}).get('p', 0)
-            if not price or price < 5 or price > 150: continue
+            if not price or price < 5 or price > 500: continue
 
             end = datetime.utcnow().isoformat() + 'Z'
             start = (datetime.utcnow() - timedelta(days=3)).isoformat() + 'Z'
@@ -237,6 +237,11 @@ def ai_analyze():
             timeout=25)
         return jsonify(res.json()), res.status_code
     except Exception as e: return jsonify({"error": str(e)}), 500
+
+# Auto-start engine when gunicorn loads
+engine_state['running'] = True
+threading.Thread(target=engine_loop, daemon=True).start()
+log_scan("🚀 Auto engine started on server boot")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

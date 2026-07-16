@@ -215,18 +215,11 @@ def engine_loop():
         time.sleep(300)
 
 def get_congress_trades():
-    """Fetch recent congressional trades from Capitol Trades BFF API"""
+    """Fetch recent congressional trades from Senate Stock Watcher (free public API)"""
     try:
         res = requests.get(
-            "https://bff.capitoltrades.com/trades",
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "en-US,en;q=0.5",
-                "Origin": "https://www.capitoltrades.com",
-                "Referer": "https://www.capitoltrades.com/",
-            },
-            params={"pageSize": 50, "page": 1},
+            "https://senate-stock-watcher-data.s3-us-west-2.amazonaws.com/aggregate/all_transactions.json",
+            headers={"User-Agent": "Mozilla/5.0"},
             timeout=15
         )
         if not res.ok:
@@ -234,14 +227,23 @@ def get_congress_trades():
             return []
 
         data = res.json()
-        items = data.get('data', [])
         trades = []
-        for item in items:
-            ticker = item.get('ticker', '') or item.get('assetTicker', '')
-            tx_type = item.get('txType', '') or item.get('type', '')
-            if ticker and tx_type:
-                action = 'buy' if 'purchase' in tx_type.lower() or 'buy' in tx_type.lower() else 'sell'
-                trades.append({'ticker': ticker.split(':')[0], 'action': action})
+        seen = set()
+        # Get most recent 100 transactions
+        recent = data[:100] if isinstance(data, list) else []
+        for item in recent:
+            ticker = item.get('ticker', '').strip().upper()
+            tx_type = item.get('type', '').lower()
+            # Skip non-stock tickers
+            if not ticker or ticker in ('--', 'N/A', '') or len(ticker) > 5:
+                continue
+            if ticker in seen:
+                continue
+            seen.add(ticker)
+            action = 'buy' if 'purchase' in tx_type or 'buy' in tx_type else 'sell'
+            trades.append({'ticker': ticker, 'action': action})
+        
+        log_congress(f"Found {len(trades)} unique tickers from Senate Stock Watcher")
         return trades[:20]
     except Exception as e:
         log_congress(f"Error fetching trades: {str(e)[:50]}")

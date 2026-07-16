@@ -259,7 +259,7 @@ def congress_scan():
         log_congress("⏰ Outside market hours — will copy when market opens")
         return
 
-    log_congress("🏛️ Fetching congressional trades from Capitol Trades...")
+    log_congress("🏛️ Fetching congressional trades from Senate Stock Watcher...")
     trades = get_congress_trades()
 
     if not trades:

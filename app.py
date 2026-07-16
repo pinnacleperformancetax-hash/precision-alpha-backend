@@ -120,10 +120,7 @@ def check_and_sell_positions():
             should_sell = False
             reason = ''
 
-            if unrealized_pl >= RULES['takeProfitTarget']:
-                should_sell = True
-                reason = f"Take profit hit: +${unrealized_pl:.2f}"
-            elif unrealized_pl <= -RULES['maxLossPerTrade']:
+            if unrealized_pl <= -RULES['maxLossPerTrade']:
                 should_sell = True
                 reason = f"Stop loss hit: -${abs(unrealized_pl):.2f}"
 

@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import os, requests, json, threading, time, logging, re
+import os, requests, json, threading, time, logging
 from datetime import datetime, timedelta
 import pytz
 
@@ -23,23 +23,15 @@ ALERT_EMAIL       = os.environ.get("ALERT_EMAIL", "pinnacleperformancetax@gmail.
 MARKET_SCAN_LIST = ['AAPL','TSLA','NVDA','SPY','QQQ','MSFT','AMD','META','GOOGL','AMZN','NFLX','SOFI','PLTR','RIVN','COIN']
 
 RULES = {
-    'maxDailyLoss': 50, 'maxTrades': 999, 'maxPositionSize': 200,
+    'maxDailyLoss': 50, 'maxTrades': 3, 'maxPositionSize': 200,
     'maxLossPerTrade': 15, 'takeProfitTarget': 30,
-    'minConfidence': 30, 'maxVolatility': 90, 'minSyncScore': 30,
+    'minConfidence': 75, 'maxVolatility': 70, 'minSyncScore': 75,
 }
 
 engine_state = {
     'running': False, 'weekly_trades': [], 'today_pl': 0.0,
     'last_date': '', 'week_key': '', 'scan_log': [], 'trade_log': [],
 }
-
-congress_state = {
-    'running': False, 'last_scan': '', 'trade_log': [], 'scan_log': [],
-    'copied_trades': [],
-}
-
-_engine_started = False
-_congress_started = False
 
 def get_week_key():
     d = datetime.now(pytz.timezone('America/New_York'))
@@ -48,10 +40,7 @@ def get_week_key():
 def is_market_hours():
     est = datetime.now(pytz.timezone('America/New_York'))
     h, m = est.hour, est.minute
-    # 9:30am to 4:00pm EST
-    after_open = (h > 9 or (h == 9 and m >= 30))
-    before_close = (h < 16)
-    return after_open and before_close
+    return (h > 10 or (h == 10)) and (h < 15 or (h == 15 and m <= 30))
 
 def reset_if_needed():
     today = datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d')
@@ -73,13 +62,6 @@ def log_scan(msg):
     engine_state['scan_log'] = engine_state['scan_log'][:50]
     logger.info(msg)
 
-def log_congress(msg):
-    est = datetime.now(pytz.timezone('America/New_York'))
-    entry = f"{est.strftime('%I:%M:%S %p')} — {msg}"
-    congress_state['scan_log'].insert(0, entry)
-    congress_state['scan_log'] = congress_state['scan_log'][:50]
-    logger.info(f"[CONGRESS] {msg}")
-
 def send_email(symbol, side, qty, price, reason, verdict):
     try:
         requests.post("https://api.emailjs.com/api/v1.0/email/send", json={
@@ -98,53 +80,11 @@ def send_email(symbol, side, qty, price, reason, verdict):
     except Exception as e:
         logger.error(f"Email failed: {e}")
 
-def check_and_sell_positions():
-    """Auto-sell positions that hit take profit or stop loss"""
-    try:
-        res = requests.get(f"{ALPACA_BASE_URL}/positions", headers=alpaca_hdrs(), timeout=10)
-        if not res.ok:
-            return
-        positions = res.json()
-        if not positions:
-            return
-
-        for pos in positions:
-            symbol = pos.get('symbol')
-            qty = abs(int(float(pos.get('qty', 0))))
-            unrealized_pl = float(pos.get('unrealized_pl', 0))
-            current_price = float(pos.get('current_price', 0))
-
-            if qty == 0:
-                continue
-
-            should_sell = False
-            reason = ''
-
-            if unrealized_pl <= -RULES['maxLossPerTrade']:
-                should_sell = True
-                reason = f"Stop loss hit: -${abs(unrealized_pl):.2f}"
-
-            if should_sell:
-                log_scan(f"💰 {symbol} — {reason}. Selling {qty} shares...")
-                sell = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(),
-                    json={"symbol": symbol, "qty": str(qty), "side": "sell", "type": "market", "time_in_force": "day"}, timeout=10)
-                if sell.ok:
-                    log_scan(f"✅ SOLD {qty} {symbol} @ ${current_price:.2f} | P&L: ${unrealized_pl:.2f}")
-                    entry = f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · AUTO SELL: {qty} {symbol} @ ${current_price:.2f} | {reason}"
-                    engine_state['trade_log'].insert(0, entry)
-                    engine_state['trade_log'] = engine_state['trade_log'][:50]
-                    engine_state['today_pl'] += unrealized_pl
-                    send_email(symbol, 'sell', qty, current_price, reason, 'AUTO SELL')
-                else:
-                    log_scan(f"❌ Failed to sell {symbol}")
-    except Exception as e:
-        logger.error(f"Auto-sell error: {e}")
-
 def quick_ai_check(symbol, price, price_change):
     prompt = f"""Precision Alpha AI auto-scanner. Evaluate for paper trade.
 Stock: {symbol} | Price: ${price:.2f} | 1-day change: ${price_change:.2f} ({(price_change/max(price,1)*100):.1f}%)
 Respond ONLY with JSON (no markdown): {{"confidence":0-100,"volatility":0-100,"sync":0-100,"side":"buy" or "sell","reason":"one sentence"}}
-Be very aggressive. Almost all stocks should pass. confidence>30, volatility<90, sync>30 required."""
+Be conservative. confidence>75, volatility<70, sync>75 required."""
     res = requests.post("https://api.anthropic.com/v1/messages",
         headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
         json={"model": "claude-haiku-4-5-20251001", "max_tokens": 150, "messages": [{"role": "user", "content": prompt}]},
@@ -158,17 +98,17 @@ def auto_scan():
         log_scan("⏰ Outside trading hours — scan skipped"); return
     if engine_state['today_pl'] <= -RULES['maxDailyLoss']:
         log_scan("🔴 Daily loss limit hit"); return
-
-    # Check and sell existing positions first
-    check_and_sell_positions()
+    if len(engine_state['weekly_trades']) >= RULES['maxTrades']:
+        log_scan(f"🔴 Weekly limit reached ({RULES['maxTrades']})"); return
 
     log_scan(f"🔍 Scanning {len(MARKET_SCAN_LIST)} stocks...")
     for symbol in MARKET_SCAN_LIST:
+        if len(engine_state['weekly_trades']) >= RULES['maxTrades']: break
         try:
             qr = requests.get(f"{ALPACA_DATA_URL}/stocks/{symbol}/trades/latest", headers=alpaca_hdrs(), timeout=10)
             if not qr.ok: continue
             price = qr.json().get('trade', {}).get('p', 0)
-            if not price or price < 5 or price > 500: continue
+            if not price or price < 5 or price > 150: continue
 
             end = datetime.utcnow().isoformat() + 'Z'
             start = (datetime.utcnow() - timedelta(days=3)).isoformat() + 'Z'
@@ -214,135 +154,6 @@ def engine_loop():
         except Exception as e: logger.error(f"Engine error: {e}")
         time.sleep(300)
 
-def get_congress_trades():
-    """Fetch recent congressional trades from House Stock Watcher GitHub API"""
-    try:
-        # Try multiple free sources
-        urls = [
-            "https://house-stock-watcher-data.s3-us-east-2.amazonaws.com/data/all_transactions.json",
-            "https://raw.githubusercontent.com/ratemycongress/congressional-stock-trades/main/data/trades.json",
-        ]
-        
-        data = None
-        for url in urls:
-            try:
-                res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-                if res.ok:
-                    data = res.json()
-                    log_congress(f"Connected to: {url[:50]}...")
-                    break
-                else:
-                    log_congress(f"URL returned {res.status_code}, trying next...")
-            except:
-                continue
-        
-        if not data:
-            log_congress("All sources failed — using fallback stock list")
-            # Fallback: use popular stocks that congress frequently buys
-            return [
-                {'ticker': 'NVDA', 'action': 'buy'},
-                {'ticker': 'MSFT', 'action': 'buy'},
-                {'ticker': 'AAPL', 'action': 'buy'},
-                {'ticker': 'AMZN', 'action': 'buy'},
-                {'ticker': 'GOOGL', 'action': 'buy'},
-            ]
-
-        trades = []
-        seen = set()
-        recent = data[:100] if isinstance(data, list) else []
-        for item in recent:
-            ticker = item.get('ticker', '').strip().upper()
-            tx_type = str(item.get('type', '') or item.get('transaction_type', '')).lower()
-            if not ticker or ticker in ('--', 'N/A', '') or len(ticker) > 5:
-                continue
-            if ticker in seen:
-                continue
-            seen.add(ticker)
-            action = 'buy' if 'purchase' in tx_type or 'buy' in tx_type else 'sell'
-            trades.append({'ticker': ticker, 'action': action})
-        
-        log_congress(f"Found {len(trades)} unique tickers")
-        return trades[:20]
-    except Exception as e:
-        log_congress(f"Error: {str(e)[:50]}")
-        return []
-
-def congress_scan():
-    today = datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d')
-    if congress_state['last_scan'] == today:
-        log_congress("Already scanned today — skipping")
-        return
-
-    if not is_market_hours():
-        log_congress("⏰ Outside market hours — will copy when market opens")
-        return
-
-    log_congress("🏛️ Fetching congressional trades from Senate Stock Watcher...")
-    trades = get_congress_trades()
-
-    if not trades:
-        log_congress("No trades found or error fetching data")
-        return
-
-    log_congress(f"Found {len(trades)} recent congressional trades")
-    bought = 0
-
-    for trade in trades:
-        ticker = trade['ticker']
-        action = trade['action']
-
-        if action != 'buy':
-            continue
-
-        trade_key = f"{today}_{ticker}"
-        if trade_key in congress_state['copied_trades']:
-            continue
-
-        if bought >= 3:
-            break
-
-        try:
-            qr = requests.get(f"{ALPACA_DATA_URL}/stocks/{ticker}/trades/latest", headers=alpaca_hdrs(), timeout=10)
-            if not qr.ok:
-                continue
-            price = qr.json().get('trade', {}).get('p', 0)
-            if not price or price < 1 or price > 1000:
-                continue
-
-            qty = max(1, int(RULES['maxPositionSize'] / price))
-            log_congress(f"📋 Copying congressional BUY: {ticker} @ ${price:.2f}")
-
-            or_ = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(),
-                json={"symbol": ticker, "qty": str(qty), "side": "buy", "type": "market", "time_in_force": "day"}, timeout=10)
-
-            if or_.ok:
-                congress_state['copied_trades'].append(trade_key)
-                entry = f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · CONGRESS COPY: BUY {qty} {ticker} @ ${price:.2f}"
-                congress_state['trade_log'].insert(0, entry)
-                congress_state['trade_log'] = congress_state['trade_log'][:50]
-                log_congress(f"✅ ORDER PLACED: BUY {qty} {ticker} @ ${price:.2f}")
-                send_email(ticker, 'buy', qty, price, 'Congressional trade copy', 'CONGRESS COPY')
-                bought += 1
-            else:
-                log_congress(f"❌ Order failed for {ticker}")
-
-        except Exception as e:
-            log_congress(f"Error copying {ticker}: {str(e)[:40]}")
-            continue
-
-        time.sleep(1)
-
-    congress_state['last_scan'] = today
-    log_congress(f"✓ Congressional scan complete — copied {bought} trades")
-
-def congress_loop():
-    while congress_state['running']:
-        try:
-            congress_scan()
-        except Exception as e:
-            logger.error(f"Congress engine error: {e}")
-        time.sleep(3600)
-
 @app.route("/")
 def index():
     return jsonify({"app": "Precision Alpha AI Backend", "status": "running", "mode": "paper-only"})
@@ -364,7 +175,6 @@ def stop_engine():
 @app.route("/api/engine/kill", methods=["POST"])
 def kill_engine():
     engine_state['running'] = False
-    congress_state['running'] = False
     log_scan("⛔ KILL SWITCH activated")
     return jsonify({"status": "killed"})
 
@@ -378,36 +188,6 @@ def engine_status():
         "trade_log": engine_state['trade_log'][:20],
         "is_market_hours": is_market_hours(),
     })
-
-@app.route("/api/congress/status")
-def congress_status():
-    return jsonify({
-        "running": congress_state['running'],
-        "last_scan": congress_state['last_scan'],
-        "scan_log": congress_state['scan_log'][:20],
-        "trade_log": congress_state['trade_log'][:20],
-        "copied_today": len([t for t in congress_state['copied_trades'] if t.startswith(datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d'))]),
-    })
-
-@app.route("/api/congress/start", methods=["POST"])
-def start_congress():
-    if not congress_state['running']:
-        congress_state['running'] = True
-        threading.Thread(target=congress_loop, daemon=True).start()
-        log_congress("🏛️ Congressional copy engine started")
-    return jsonify({"status": "running"})
-
-@app.route("/api/congress/stop", methods=["POST"])
-def stop_congress():
-    congress_state['running'] = False
-    log_congress("⏹ Congressional copy engine stopped")
-    return jsonify({"status": "stopped"})
-
-@app.route("/api/congress/scan", methods=["POST"])
-def manual_congress_scan():
-    congress_state['last_scan'] = ''
-    threading.Thread(target=congress_scan, daemon=True).start()
-    return jsonify({"status": "scanning"})
 
 @app.route("/api/bars/<symbol>")
 def get_bars(symbol):
@@ -457,19 +237,6 @@ def ai_analyze():
             timeout=25)
         return jsonify(res.json()), res.status_code
     except Exception as e: return jsonify({"error": str(e)}), 500
-
-# Auto-start engines on boot — only once
-if not _engine_started:
-    _engine_started = True
-    engine_state['running'] = True
-    threading.Thread(target=engine_loop, daemon=True).start()
-    log_scan("🚀 Auto engine started on server boot")
-
-if not _congress_started:
-    _congress_started = True
-    congress_state['running'] = True
-    threading.Thread(target=congress_loop, daemon=True).start()
-    log_congress("🏛️ Congressional copy engine started on server boot")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

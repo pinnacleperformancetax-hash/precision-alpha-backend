@@ -63,6 +63,18 @@ def reset_if_needed():
         engine_state['weekly_trades'] = []
         engine_state['week_key'] = wk
 
+def get_real_today_pl():
+    """Get actual today P&L from Alpaca positions"""
+    try:
+        res = requests.get(f"{ALPACA_BASE_URL}/positions", headers=alpaca_hdrs(), timeout=10)
+        if not res.ok:
+            return engine_state['today_pl']
+        positions = res.json()
+        total_pl = sum(float(p.get('unrealized_pl', 0)) for p in positions)
+        return total_pl
+    except:
+        return engine_state['today_pl']
+
 def alpaca_hdrs():
     return {'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET, 'Content-Type': 'application/json'}
 
@@ -160,8 +172,10 @@ def auto_scan():
     # ALWAYS check and sell positions first — even if daily loss limit hit
     check_and_sell_positions()
 
-    if engine_state['today_pl'] <= -RULES['maxDailyLoss']:
-        log_scan("🔴 Daily loss limit hit — no new buys"); return
+    real_pl = get_real_today_pl()
+    engine_state['today_pl'] = real_pl
+    if real_pl <= -RULES['maxDailyLoss']:
+        log_scan(f"🔴 Daily loss limit hit (P&L: ${real_pl:.2f}) — no new buys"); return
 
     log_scan(f"🔍 Scanning {len(MARKET_SCAN_LIST)} stocks...")
     for symbol in MARKET_SCAN_LIST:

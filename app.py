@@ -64,14 +64,17 @@ def reset_if_needed():
         engine_state['week_key'] = wk
 
 def get_real_today_pl():
-    """Get actual today P&L from Alpaca positions"""
+    """Get actual today P&L from Alpaca account"""
     try:
-        res = requests.get(f"{ALPACA_BASE_URL}/positions", headers=alpaca_hdrs(), timeout=10)
+        res = requests.get(f"{ALPACA_BASE_URL}/account", headers=alpaca_hdrs(), timeout=10)
         if not res.ok:
             return engine_state['today_pl']
-        positions = res.json()
-        total_pl = sum(float(p.get('unrealized_pl', 0)) for p in positions)
-        return total_pl
+        data = res.json()
+        # equity - last_equity = today's P&L
+        equity = float(data.get('equity', 0))
+        last_equity = float(data.get('last_equity', equity))
+        today_pl = equity - last_equity
+        return today_pl
     except:
         return engine_state['today_pl']
 
@@ -472,6 +475,30 @@ def ai_analyze():
             timeout=25)
         return jsonify(res.json()), res.status_code
     except Exception as e: return jsonify({"error": str(e)}), 500
+
+
+# Benchmark state — persists in memory (resets on server restart)
+benchmark_state = {
+    'real_value': 0.0,
+    'history': [],
+}
+
+@app.route("/api/benchmark/get")
+def get_benchmark():
+    return jsonify(benchmark_state)
+
+@app.route("/api/benchmark/update", methods=["POST"])
+def update_benchmark():
+    data = request.get_json()
+    val = float(data.get('real_value', 0))
+    benchmark_state['real_value'] = val
+    benchmark_state['history'].insert(0, {
+        'date': datetime.now(pytz.timezone('America/New_York')).strftime('%m/%d/%Y'),
+        'time': datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M:%S %p'),
+        'real_value': val,
+    })
+    benchmark_state['history'] = benchmark_state['history'][:30]
+    return jsonify({"status": "saved", "real_value": val})
 
 # Auto-start engines on boot — only once
 if not _engine_started:

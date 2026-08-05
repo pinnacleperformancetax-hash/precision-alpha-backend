@@ -25,7 +25,7 @@ MARKET_SCAN_LIST = ['AAPL','TSLA','NVDA','SPY','QQQ','MSFT','AMD','META','GOOGL'
 RULES = {
     'maxDailyLoss': 30, 'maxTrades': 999, 'maxPositionSize': 200,
     'maxLossPerTrade': 15, 'takeProfitTarget': 30,
-    'minConfidence': 30, 'maxVolatility': 90, 'minSyncScore': 30,
+    'minConfidence': 30, 'maxVolatility': 90, 'minSyncScore': 30, 'maxSharesPerStock': 5,
 }
 
 engine_state = {
@@ -135,9 +135,13 @@ def check_and_sell_positions():
             should_sell = False
             reason = ''
 
-            if unrealized_pl <= -RULES['maxLossPerTrade']:
+            # Calculate per-share loss
+            qty_pos = abs(int(float(pos.get('qty', 1))))
+            per_share_loss = unrealized_pl / max(qty_pos, 1)
+            
+            if per_share_loss <= -RULES['maxLossPerTrade']:
                 should_sell = True
-                reason = f"Stop loss hit: -${abs(unrealized_pl):.2f}"
+                reason = f"Stop loss hit: ${per_share_loss:.2f}/share (total: -${abs(unrealized_pl):.2f})"
 
             if should_sell:
                 log_scan(f"💰 {symbol} — {reason}. Selling {qty} shares...")
@@ -206,8 +210,19 @@ def auto_scan():
             if conf < RULES['minConfidence'] or vol > RULES['maxVolatility'] or sync < RULES['minSyncScore']:
                 log_scan(f"⚫ {symbol} — blocked (C:{conf} V:{vol} S:{sync})"); continue
 
-            qty = max(1, int(RULES['maxPositionSize'] / price))
-            log_scan(f"✅ {symbol} — {side.upper()} signal. Placing...")
+            # Check current position size — max 5 shares per stock
+            try:
+                pos_res = requests.get(f"{ALPACA_BASE_URL}/positions/{symbol}", headers=alpaca_hdrs(), timeout=10)
+                current_qty = int(float(pos_res.json().get('qty', 0))) if pos_res.ok else 0
+            except:
+                current_qty = 0
+
+            if current_qty >= RULES['maxSharesPerStock']:
+                log_scan(f"⏭ {symbol} — max {RULES['maxSharesPerStock']} shares held, skipping")
+                continue
+
+            qty = 1  # Always buy 1 share at a time
+            log_scan(f"✅ {symbol} — {side.upper()} signal. Placing... (holding {current_qty}/{RULES['maxSharesPerStock']})")
 
             or_ = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(),
                 json={"symbol": symbol, "qty": str(qty), "side": side, "type": "market", "time_in_force": "day"}, timeout=10)

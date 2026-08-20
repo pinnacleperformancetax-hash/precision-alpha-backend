@@ -498,6 +498,25 @@ def ai_analyze():
     except Exception as e: return jsonify({"error": str(e)}), 500
 
 
+
+@app.route("/api/settings/get")
+def get_settings():
+    return jsonify(RULES)
+
+@app.route("/api/settings/update", methods=["POST"])
+def update_settings():
+    data = request.get_json()
+    allowed = ['maxDailyLoss','maxTrades','maxPositionSize','maxLossPerTrade',
+               'takeProfitTarget','minConfidence','maxVolatility','minSyncScore',
+               'maxSharesPerStock','takeProfitPct']
+    updated = {}
+    for key in allowed:
+        if key in data:
+            RULES[key] = float(data[key])
+            updated[key] = RULES[key]
+    log_scan(f"⚙️ Settings updated: {updated}")
+    return jsonify({"status": "updated", "rules": RULES})
+
 # Benchmark state — persists in memory (resets on server restart)
 benchmark_state = {
     'real_value': 0.0,

@@ -61,6 +61,49 @@ congress_state = {
     'copied_trades': [],
 }
 
+# ---- State persistence ----
+# engine_state and congress_state previously lived only in memory, so any
+# server restart (a redeploy, a crash, Render's free-tier spin-down after
+# inactivity) silently wiped them — including congress_state['copied_trades'],
+# the guard that stops congress_scan() from re-buying the same ticker twice in
+# one day. On 2026-09-27 this caused GOOGL and AMZN to be bought 4x each in
+# one day, one extra buy per redeploy, because the guard kept resetting.
+#
+# This writes both state dicts to a JSON file on disk after every change and
+# reloads them on boot. IMPORTANT LIMITATION: Render's free-tier filesystem is
+# ephemeral on a fresh deploy (a new code push wipes local files, not just
+# memory) — so this protects against restarts *without* a code change (crash,
+# spin-down/wake, manual restart), which is the common case, but a real
+# redeploy still starts from blank state. For durability across every kind of
+# restart including deploys, state would need to live in an external store
+# (Postgres/Redis) rather than a local file — worth doing when the
+# multi-tenant rebuild happens.
+STATE_FILE = os.environ.get("STATE_FILE_PATH", "/tmp/precision_alpha_state.json")
+_state_lock = threading.Lock()
+
+def save_state():
+    try:
+        with _state_lock:
+            with open(STATE_FILE, 'w') as f:
+                json.dump({'engine_state': engine_state, 'congress_state': congress_state}, f)
+    except Exception as e:
+        logger.error(f"Failed to save state: {e}")
+
+def load_state():
+    try:
+        if not os.path.exists(STATE_FILE):
+            logger.info("No saved state file found — starting fresh")
+            return
+        with open(STATE_FILE, 'r') as f:
+            data = json.load(f)
+        engine_state.update(data.get('engine_state', {}))
+        congress_state.update(data.get('congress_state', {}))
+        logger.info(f"✅ Restored state from {STATE_FILE} — congress copied_trades: {len(congress_state.get('copied_trades', []))}, engine running: {engine_state.get('running')}")
+    except Exception as e:
+        logger.error(f"Failed to load state, starting fresh: {e}")
+
+load_state()
+
 _engine_started = False
 _congress_started = False
 
@@ -78,13 +121,18 @@ def is_market_hours():
 
 def reset_if_needed():
     today = datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d')
+    changed = False
     if engine_state['last_date'] != today:
         engine_state['today_pl'] = 0.0
         engine_state['last_date'] = today
+        changed = True
     wk = get_week_key()
     if engine_state['week_key'] != wk:
         engine_state['weekly_trades'] = []
         engine_state['week_key'] = wk
+        changed = True
+    if changed:
+        save_state()
 
 def get_real_today_pl():
     """Get actual today P&L from Alpaca account"""
@@ -182,6 +230,7 @@ def check_and_sell_positions():
                     engine_state['trade_log'].insert(0, entry)
                     engine_state['trade_log'] = engine_state['trade_log'][:50]
                     engine_state['today_pl'] += unrealized_pl
+                    save_state()
                     send_email(symbol, 'sell', qty, current_price, reason, 'AUTO SELL')
                 else:
                     log_scan(f"❌ Failed to sell {symbol}")
@@ -415,6 +464,7 @@ def auto_scan():
             entry = f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · AUTO: {side.upper()} {qty} {symbol} @ ${price:.2f} · {reason}"
             engine_state['trade_log'].insert(0, entry)
             engine_state['trade_log'] = engine_state['trade_log'][:50]
+            save_state()
             log_scan(f"🚀 ORDER PLACED: {side.upper()} {qty} {symbol} @ ${price:.2f}")
             send_email(symbol, side, qty, price, reason, 'AUTO TRADE')
             break
@@ -556,6 +606,11 @@ def congress_scan():
                 entry = f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · CONGRESS COPY: BUY {qty} {ticker} @ ${price:.2f}"
                 congress_state['trade_log'].insert(0, entry)
                 congress_state['trade_log'] = congress_state['trade_log'][:50]
+                # Save immediately after recording the buy — this is the exact
+                # guard that failed on 2026-09-27: if the server restarts
+                # before this is persisted, copied_trades reverts to its last
+                # saved state and the same ticker can be bought again today.
+                save_state()
                 log_congress(f"✅ ORDER PLACED: BUY {qty} {ticker} @ ${price:.2f}")
                 send_email(ticker, 'buy', qty, price, 'Congressional trade copy', 'CONGRESS COPY')
                 bought += 1
@@ -569,6 +624,7 @@ def congress_scan():
         time.sleep(1)
 
     congress_state['last_scan'] = today
+    save_state()
     log_congress(f"✓ Congressional scan complete — copied {bought} trades")
 
 def congress_loop():
@@ -588,6 +644,7 @@ def index():
 def start_engine():
     if not engine_state['running']:
         engine_state['running'] = True
+        save_state()
         threading.Thread(target=engine_loop, daemon=True).start()
         log_scan("🚀 Auto engine started")
     return jsonify({"status": "running"})
@@ -596,6 +653,7 @@ def start_engine():
 @require_api_key
 def stop_engine():
     engine_state['running'] = False
+    save_state()
     log_scan("⏹ Auto engine stopped")
     return jsonify({"status": "stopped"})
 
@@ -604,6 +662,7 @@ def stop_engine():
 def kill_engine():
     engine_state['running'] = False
     congress_state['running'] = False
+    save_state()
     log_scan("⛔ KILL SWITCH activated")
     return jsonify({"status": "killed"})
 
@@ -633,6 +692,7 @@ def congress_status():
 def start_congress():
     if not congress_state['running']:
         congress_state['running'] = True
+        save_state()
         threading.Thread(target=congress_loop, daemon=True).start()
         log_congress("🏛️ Congressional copy engine started")
     return jsonify({"status": "running"})
@@ -641,6 +701,7 @@ def start_congress():
 @require_api_key
 def stop_congress():
     congress_state['running'] = False
+    save_state()
     log_congress("⏹ Congressional copy engine stopped")
     return jsonify({"status": "stopped"})
 

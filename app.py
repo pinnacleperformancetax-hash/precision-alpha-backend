@@ -263,17 +263,28 @@ def get_sentiment(symbol):
 Headlines:
 {headlines_text}
 
-Respond ONLY with JSON (no markdown): {{"sentiment":"bullish","bearish","neutral","score":-100 to 100,"summary":"one sentence"}}
-Score: 100=very bullish, 0=neutral, -100=very bearish"""
+Respond ONLY with JSON (no markdown), matching this exact shape:
+{{"sentiment": "bullish", "score": 42, "summary": "one sentence"}}
+Where "sentiment" is one of: bullish, bearish, neutral. "score" is a number from -100 (very bearish) to 100 (very bullish)."""
 
         res = requests.post("https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
             json={"model": "claude-haiku-4-5-20251001", "max_tokens": 150, "messages": [{"role": "user", "content": sentiment_prompt}]},
             timeout=15)
-        text = res.json()['content'][0]['text'].replace('```json','').replace('```','').strip()
+        if not res.ok:
+            logger.error(f"Sentiment API error for {symbol}: HTTP {res.status_code} — {res.text[:300]}")
+            return None
+        body = res.json()
+        if 'content' not in body:
+            logger.error(f"Sentiment API returned no 'content' for {symbol}: {body}")
+            return None
+        text = body['content'][0]['text'].replace('```json','').replace('```','').strip()
         sentiment_data = json.loads(text)
         sentiment_data['headlines'] = headlines[:3]
         return sentiment_data
+    except json.JSONDecodeError as e:
+        logger.error(f"Sentiment JSON parse error for {symbol}: {e} — raw text was not valid JSON")
+        return None
     except Exception as e:
         logger.error(f"Sentiment error for {symbol}: {e}")
         return None
@@ -366,14 +377,23 @@ Key factors to consider:
 - Low volume moves are less reliable
 - Stock trading above open price is bullish
 
-Respond ONLY with JSON (no markdown): {{"confidence":0-100,"volatility":0-100,"sync":0-100,"side":"buy" or "sell","reason":"one sentence including volume and sentiment context"}}
+Respond ONLY with JSON (no markdown), matching this exact shape:
+{{"confidence": 65, "volatility": 40, "sync": 70, "side": "buy", "reason": "one sentence including volume and sentiment context"}}
+Where confidence, volatility, and sync are numbers 0-100, and side is either "buy" or "sell".
 Be very aggressive. confidence>30, volatility<90, sync>30 required."""
 
     res = requests.post("https://api.anthropic.com/v1/messages",
         headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
         json={"model": "claude-haiku-4-5-20251001", "max_tokens": 200, "messages": [{"role": "user", "content": prompt}]},
         timeout=20)
-    text = res.json()['content'][0]['text'].replace('```json','').replace('```','').strip()
+    if not res.ok:
+        logger.error(f"AI check API error for {symbol}: HTTP {res.status_code} — {res.text[:300]}")
+        raise ValueError(f"AI check failed: HTTP {res.status_code}")
+    body = res.json()
+    if 'content' not in body:
+        logger.error(f"AI check returned no 'content' for {symbol}: {body}")
+        raise ValueError("AI check returned no content")
+    text = body['content'][0]['text'].replace('```json','').replace('```','').strip()
     result = json.loads(text)
     
     # Volume boost: if volume is 2x+ average and momentum is positive, boost confidence

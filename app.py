@@ -54,6 +54,7 @@ RULES = {
 engine_state = {
     'running': False, 'weekly_trades': [], 'today_pl': 0.0,
     'last_date': '', 'week_key': '', 'scan_log': [], 'trade_log': [],
+    'last_weekly_email_week': '',
 }
 
 congress_state = {
@@ -166,23 +167,66 @@ def log_congress(msg):
     congress_state['scan_log'] = congress_state['scan_log'][:50]
     logger.info(f"[CONGRESS] {msg}")
 
-def send_email(symbol, side, qty, price, reason, verdict):
+def send_email(subject, body_text, template_params_override=None):
+    """Generic email sender via EmailJS. Logs the real response on failure —
+    previously this fired the request and never checked whether EmailJS
+    actually accepted it, so a rejection (very common for server-side calls:
+    many EmailJS accounts have 'Strict Origin Check' enabled, which blocks
+    requests with no browser Origin header — exactly what a backend call is)
+    failed completely silently."""
     try:
-        requests.post("https://api.emailjs.com/api/v1.0/email/send", json={
+        params = {
+            "to_email": ALERT_EMAIL,
+            "subject": subject,
+            "trade_reason": body_text,
+        }
+        if template_params_override:
+            params.update(template_params_override)
+        res = requests.post("https://api.emailjs.com/api/v1.0/email/send", json={
             "service_id": EMAILJS_SERVICE, "template_id": EMAILJS_TEMPLATE, "user_id": EMAILJS_PUBLIC,
-            "template_params": {
-                "to_email": ALERT_EMAIL,
-                "subject": f"🤖 Precision Alpha: {verdict} — {side.upper()} {qty} {symbol}",
-                "trade_symbol": symbol, "trade_side": side.upper(), "trade_qty": qty,
-                "trade_price": f"${price:.2f}", "trade_total": f"${price*qty:.2f}",
-                "trade_reason": reason, "trade_verdict": verdict,
-                "trade_time": datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d %I:%M %p EST'),
-                "stop_loss": f"${price-(RULES['maxLossPerTrade']/qty):.2f}",
-                "take_profit": f"${price+(RULES['takeProfitTarget']/qty):.2f}",
-            }
+            "template_params": params
         }, timeout=10)
+        if not res.ok:
+            logger.error(f"Email failed: HTTP {res.status_code} — {res.text[:300]}")
+        else:
+            logger.info("✉️ Email sent successfully")
     except Exception as e:
         logger.error(f"Email failed: {e}")
+
+def build_weekly_summary_text():
+    """Compose the Saturday weekly digest from this week's trades."""
+    trades = engine_state.get('weekly_trades', [])
+    if not trades:
+        return "No trades were placed this week."
+    lines = [f"Weekly trading summary — {len(trades)} trade(s) this week:\n"]
+    by_source = {}
+    for t in trades:
+        src = t.get('source', 'unknown')
+        by_source.setdefault(src, []).append(t)
+    for src, items in by_source.items():
+        lines.append(f"\n{src.upper()} ({len(items)} trade(s)):")
+        for t in items:
+            price = t.get('price', 0) or 0
+            lines.append(f"  • BUY {t.get('qty')} {t.get('symbol')}" + (f" @ ${price:.2f}" if price else ""))
+    real_pl = get_real_today_pl()
+    lines.append(f"\nToday's P&L: ${real_pl:.2f}")
+    return "\n".join(lines)
+
+def check_and_send_weekly_email():
+    """Fires once, on Saturday, summarizing the trading week — replaces the
+    old per-trade emails for auto/congress trades, which were both spammy
+    and silently failing (see send_email's docstring)."""
+    est = datetime.now(pytz.timezone('America/New_York'))
+    if est.weekday() != 5:  # Monday=0 ... Saturday=5
+        return
+    wk = get_week_key()
+    if engine_state.get('last_weekly_email_week') == wk:
+        return  # already sent this week
+    summary = build_weekly_summary_text()
+    send_email(f"📊 Precision Alpha: Weekly Trading Summary — {est.strftime('%Y-%m-%d')}", summary)
+    engine_state['last_weekly_email_week'] = wk
+    save_state()
+    log_scan("✉️ Weekly summary email sent")
 
 def check_and_sell_positions():
     """Auto-sell positions that hit take profit or stop loss"""
@@ -231,7 +275,8 @@ def check_and_sell_positions():
                     engine_state['trade_log'] = engine_state['trade_log'][:50]
                     engine_state['today_pl'] += unrealized_pl
                     save_state()
-                    send_email(symbol, 'sell', qty, current_price, reason, 'AUTO SELL')
+                    # No per-trade email — see check_and_send_weekly_email(); this
+                    # still shows up in the weekly summary via trade_log if desired.
                 else:
                     log_scan(f"❌ Failed to sell {symbol}")
     except Exception as e:
@@ -489,7 +534,7 @@ def auto_scan():
             engine_state['trade_log'] = engine_state['trade_log'][:50]
             save_state()
             log_scan(f"🚀 ORDER PLACED: {side.upper()} {qty} {symbol} @ ${price:.2f}")
-            send_email(symbol, side, qty, price, reason, 'AUTO TRADE')
+            # No per-trade email — see check_and_send_weekly_email().
             break
         except Exception as e:
             log_scan(f"⚫ {symbol} — {str(e)[:40]}"); continue
@@ -501,6 +546,17 @@ def engine_loop():
         try: auto_scan()
         except Exception as e: logger.error(f"Engine error: {e}")
         time.sleep(300)
+
+def weekly_email_loop():
+    """Runs independently of the trading engines' on/off state, so the
+    Saturday summary still gets checked and sent even if you've stopped
+    Auto/Congress engines that day. Checks every 30 minutes — cheap, and
+    check_and_send_weekly_email() itself no-ops on any day but Saturday, and
+    again after it's already sent once that week."""
+    while True:
+        try: check_and_send_weekly_email()
+        except Exception as e: logger.error(f"Weekly email check error: {e}")
+        time.sleep(1800)
 
 def get_congress_trades():
     """Fetch recent congressional trades from House Stock Watcher GitHub API"""
@@ -653,7 +709,7 @@ def congress_scan():
                 # saved state and the same ticker can be bought again today.
                 save_state()
                 log_congress(f"✅ ORDER PLACED: BUY {qty} {ticker} @ ${price:.2f}")
-                send_email(ticker, 'buy', qty, price, 'Congressional trade copy', 'CONGRESS COPY')
+                # No per-trade email — see check_and_send_weekly_email().
                 bought += 1
             else:
                 log_congress(f"❌ Order failed for {ticker}")
@@ -815,6 +871,7 @@ def orders():
     except Exception as e: return jsonify({"error": str(e)}), 500
 
 @app.route("/api/ai/analyze", methods=["POST"])
+@require_api_key
 def ai_analyze():
     try:
         data = request.get_json()
@@ -968,6 +1025,7 @@ def get_benchmark():
     return jsonify(benchmark_state)
 
 @app.route("/api/benchmark/update", methods=["POST"])
+@require_api_key
 def update_benchmark():
     data = request.get_json()
     val = float(data.get('real_value', 0))
@@ -992,6 +1050,9 @@ if not _congress_started:
     congress_state['running'] = True
     threading.Thread(target=congress_loop, daemon=True).start()
     log_congress("🏛️ Congressional copy engine started on server boot")
+
+# Runs independently of engine on/off state — always checking for Saturday.
+threading.Thread(target=weekly_email_loop, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

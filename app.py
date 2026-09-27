@@ -435,6 +435,9 @@ def auto_scan():
     if real_pl <= -RULES['maxDailyLoss']:
         log_scan(f"🔴 Daily loss limit hit (P&L: ${real_pl:.2f}) — no new buys"); return
 
+    if RULES['maxTrades'] < 999 and len(engine_state['weekly_trades']) >= RULES['maxTrades']:
+        log_scan(f"🔴 Weekly trade limit reached ({len(engine_state['weekly_trades'])}/{int(RULES['maxTrades'])}) — no new buys"); return
+
     log_scan(f"🔍 Scanning {len(MARKET_SCAN_LIST)} stocks...")
     for symbol in MARKET_SCAN_LIST:
         try:
@@ -480,7 +483,7 @@ def auto_scan():
             if not or_.ok:
                 log_scan(f"❌ {symbol} — order failed"); continue
 
-            engine_state['weekly_trades'].append({'symbol': symbol, 'side': side, 'qty': qty, 'price': price})
+            engine_state['weekly_trades'].append({'symbol': symbol, 'side': side, 'qty': qty, 'price': price, 'source': 'auto'})
             entry = f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · AUTO: {side.upper()} {qty} {symbol} @ ${price:.2f} · {reason}"
             engine_state['trade_log'].insert(0, entry)
             engine_state['trade_log'] = engine_state['trade_log'][:50]
@@ -562,6 +565,14 @@ def congress_scan():
         log_congress("⏰ Outside market hours — will copy when market opens")
         return
 
+    # Weekly trade limit applies across BOTH engines (and manual trades — see
+    # /api/orders) so it can't be bypassed by switching which engine trades.
+    if RULES['maxTrades'] < 999 and len(engine_state['weekly_trades']) >= RULES['maxTrades']:
+        log_congress(f"🔴 Weekly trade limit reached ({len(engine_state['weekly_trades'])}/{int(RULES['maxTrades'])}) — no new buys")
+        congress_state['last_scan'] = today
+        save_state()
+        return
+
     log_congress("🏛️ Fetching congressional trades from Senate Stock Watcher...")
     trades = get_congress_trades()
 
@@ -584,6 +595,11 @@ def congress_scan():
             continue
 
         if bought >= 3:
+            break
+
+        # Also stop mid-scan if this batch of buys pushes past the weekly limit.
+        if RULES['maxTrades'] < 999 and len(engine_state['weekly_trades']) >= RULES['maxTrades']:
+            log_congress(f"🔴 Weekly trade limit reached mid-scan ({len(engine_state['weekly_trades'])}/{int(RULES['maxTrades'])}) — stopping")
             break
 
         # FIX: enforce the same max-shares-per-stock cap the Auto Engine uses.
@@ -623,6 +639,11 @@ def congress_scan():
 
             if or_.ok:
                 congress_state['copied_trades'].append(trade_key)
+                # Count congress buys toward the shared weekly trade limit —
+                # engine_state['weekly_trades'] is the one counter both
+                # engines (and manual trades, see /api/orders) all add to,
+                # so the limit can't be bypassed by switching which engine trades.
+                engine_state['weekly_trades'].append({'symbol': ticker, 'side': 'buy', 'qty': qty, 'price': price, 'source': 'congress'})
                 entry = f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · CONGRESS COPY: BUY {qty} {ticker} @ ${price:.2f}"
                 congress_state['trade_log'].insert(0, entry)
                 congress_state['trade_log'] = congress_state['trade_log'][:50]
@@ -772,7 +793,22 @@ def orders():
             logger.warning("⚠️ API_KEY not set — POST /api/orders is UNPROTECTED")
     try:
         if request.method == "POST":
-            res = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(), json=request.get_json(), timeout=10)
+            order_data = request.get_json() or {}
+            side = str(order_data.get('side', '')).lower()
+            # Weekly trade limit applies to manual buys too — otherwise it's
+            # trivially bypassed by just placing trades from the Trade page
+            # instead of letting an engine do it. Sells aren't gated: closing
+            # a position shouldn't be blocked by a limit meant to cap new exposure.
+            reset_if_needed()
+            if side == 'buy' and RULES['maxTrades'] < 999 and len(engine_state['weekly_trades']) >= RULES['maxTrades']:
+                return jsonify({"message": f"Weekly trade limit reached ({len(engine_state['weekly_trades'])}/{int(RULES['maxTrades'])})"}), 429
+            res = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(), json=order_data, timeout=10)
+            if res.ok and side == 'buy':
+                engine_state['weekly_trades'].append({
+                    'symbol': order_data.get('symbol', ''), 'side': 'buy',
+                    'qty': order_data.get('qty', ''), 'price': 0, 'source': 'manual'
+                })
+                save_state()
         else:
             res = requests.get(f"{ALPACA_BASE_URL}/orders?status={request.args.get('status','all')}&limit={request.args.get('limit','50')}", headers=alpaca_hdrs(), timeout=10)
         return jsonify(res.json()), res.status_code

@@ -1,11 +1,15 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from functools import wraps
 import os, requests, json, threading, time, logging, re
 from datetime import datetime, timedelta
 import pytz
 
 app = Flask(__name__)
-CORS(app, origins=["https://precision-alpha-ai.netlify.app", "*"])
+# NOTE: CORS previously allowed "*" alongside the named Netlify origin, which
+# defeats the point of naming an origin at all (any site could call this API
+# from a browser). Restricted to just your frontend's real origin.
+CORS(app, origins=["https://precision-alpha-ai.netlify.app"])
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,6 +23,25 @@ EMAILJS_SERVICE   = os.environ.get("EMAILJS_SERVICE", "service_rucosmz")
 EMAILJS_TEMPLATE  = os.environ.get("EMAILJS_TEMPLATE", "template_qajvk5t")
 EMAILJS_PUBLIC    = os.environ.get("EMAILJS_PUBLIC", "i9a72iQL0ChaDHoZL")
 ALERT_EMAIL       = os.environ.get("ALERT_EMAIL", "pinnacleperformancetax@gmail.com")
+
+# Shared secret for state-changing routes (placing orders, starting/stopping
+# engines, changing settings). Set this in Render's environment variables —
+# it is NOT hardcoded here. Until you set it, these routes stay open and a
+# warning is logged on every protected request, so nothing breaks before you
+# configure it, but you should set API_KEY as soon as possible.
+API_KEY = os.environ.get("API_KEY", "")
+
+def require_api_key(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not API_KEY:
+            logger.warning(f"⚠️ API_KEY not set — {request.path} is UNPROTECTED")
+            return fn(*args, **kwargs)
+        supplied = request.headers.get("X-API-Key", "")
+        if supplied != API_KEY:
+            return jsonify({"error": "unauthorized"}), 401
+        return fn(*args, **kwargs)
+    return wrapper
 
 MARKET_SCAN_LIST = ['AAPL','TSLA','NVDA','SPY','QQQ','MSFT','AMD','META','GOOGL','AMZN','NFLX','SOFI','PLTR','RIVN','COIN','SMCI','ARM','UBER','ORCL','JPM','V','DIS','BAC','CRM','PANW']
 
@@ -165,17 +188,170 @@ def check_and_sell_positions():
     except Exception as e:
         logger.error(f"Auto-sell error: {e}")
 
+def get_sentiment(symbol):
+    """Get sentiment score from recent news headlines using AI"""
+    try:
+        # Get recent news from Alpaca
+        res = requests.get(
+            f"https://data.alpaca.markets/v1beta1/news?symbols={symbol}&limit=5",
+            headers=alpaca_hdrs(), timeout=10
+        )
+        if not res.ok:
+            return None
+        
+        news_items = res.json().get('news', [])
+        if not news_items:
+            return None
+        
+        # Extract headlines
+        headlines = [item.get('headline', '') for item in news_items if item.get('headline')]
+        if not headlines:
+            return None
+        
+        # Ask Claude to analyze sentiment
+        headlines_text = "\n".join([f"- {h}" for h in headlines[:5]])
+        sentiment_prompt = f"""Analyze the sentiment of these recent news headlines for {symbol} stock.
+Headlines:
+{headlines_text}
+
+Respond ONLY with JSON (no markdown): {{"sentiment":"bullish","bearish","neutral","score":-100 to 100,"summary":"one sentence"}}
+Score: 100=very bullish, 0=neutral, -100=very bearish"""
+
+        res = requests.post("https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 150, "messages": [{"role": "user", "content": sentiment_prompt}]},
+            timeout=15)
+        text = res.json()['content'][0]['text'].replace('```json','').replace('```','').strip()
+        sentiment_data = json.loads(text)
+        sentiment_data['headlines'] = headlines[:3]
+        return sentiment_data
+    except Exception as e:
+        logger.error(f"Sentiment error for {symbol}: {e}")
+        return None
+
+def get_volume_data(symbol):
+    """Get volume data for a symbol"""
+    try:
+        end = datetime.utcnow().isoformat() + 'Z'
+        start = (datetime.utcnow() - timedelta(days=10)).isoformat() + 'Z'
+        res = requests.get(
+            f"{ALPACA_DATA_URL}/stocks/{symbol}/bars?timeframe=1Day&start={start}&end={end}&limit=10",
+            headers=alpaca_hdrs(), timeout=10
+        )
+        if not res.ok:
+            return None
+        bars = res.json().get('bars', [])
+        if len(bars) < 2:
+            return None
+        
+        # Calculate volume metrics
+        recent_vol = bars[-1].get('v', 0)
+        avg_vol = sum(b.get('v', 0) for b in bars[:-1]) / max(len(bars) - 1, 1)
+        vol_ratio = recent_vol / avg_vol if avg_vol > 0 else 1
+        
+        # Price momentum (5 day)
+        oldest_close = bars[0].get('c', 0)
+        newest_close = bars[-1].get('c', 0)
+        momentum_5d = ((newest_close - oldest_close) / max(oldest_close, 1)) * 100
+        
+        # Intraday range
+        high = bars[-1].get('h', 0)
+        low = bars[-1].get('l', 0)
+        close = bars[-1].get('c', 0)
+        open_price = bars[-1].get('o', 0)
+        
+        return {
+            'volume': recent_vol,
+            'avg_volume': int(avg_vol),
+            'volume_ratio': round(vol_ratio, 2),
+            'momentum_5d': round(momentum_5d, 2),
+            'high': high,
+            'low': low,
+            'close': close,
+            'open': open_price,
+            'above_open': close > open_price,
+        }
+    except Exception as e:
+        logger.error(f"Volume data error for {symbol}: {e}")
+        return None
+
 def quick_ai_check(symbol, price, price_change):
+    """Enhanced AI check with volume and price momentum analysis"""
+    # Get volume data
+    vol_data = get_volume_data(symbol)
+    
+    # Build enhanced prompt with volume and momentum data
+    vol_info = ""
+    if vol_data:
+        vol_info = f"""
+Volume Analysis:
+- Today volume: {vol_data['volume']:,} shares
+- Avg volume (9 days): {vol_data['avg_volume']:,} shares  
+- Volume ratio: {vol_data['volume_ratio']}x average {'(HIGH VOLUME - strong signal)' if vol_data['volume_ratio'] > 1.5 else '(normal volume)'}
+- 5-day price momentum: {vol_data['momentum_5d']:+.2f}%
+- Trading above open price: {vol_data['above_open']}
+- Day range: ${vol_data['low']:.2f} - ${vol_data['high']:.2f}"""
+
+    # Get sentiment data
+    sentiment = get_sentiment(symbol)
+    sentiment_info = ""
+    if sentiment:
+        sentiment_info = f"""
+News Sentiment Analysis:
+- Overall sentiment: {sentiment.get('sentiment', 'neutral').upper()}
+- Sentiment score: {sentiment.get('score', 0)}/100
+- Summary: {sentiment.get('summary', 'No summary')}
+- Recent headlines: {'; '.join(sentiment.get('headlines', [])[:2])}"""
+
     prompt = f"""Precision Alpha AI auto-scanner. Evaluate for paper trade.
+
 Stock: {symbol} | Price: ${price:.2f} | 1-day change: ${price_change:.2f} ({(price_change/max(price,1)*100):.1f}%)
-Respond ONLY with JSON (no markdown): {{"confidence":0-100,"volatility":0-100,"sync":0-100,"side":"buy" or "sell","reason":"one sentence"}}
-Be very aggressive. Almost all stocks should pass. confidence>30, volatility<90, sync>30 required."""
+{vol_info}
+{sentiment_info}
+
+Key factors to consider:
+- High volume (>1.5x average) confirms price moves — stronger signal
+- Positive 5-day momentum + high volume = strong buy signal
+- Bullish news sentiment increases confidence
+- Bearish news sentiment reduces confidence
+- Low volume moves are less reliable
+- Stock trading above open price is bullish
+
+Respond ONLY with JSON (no markdown): {{"confidence":0-100,"volatility":0-100,"sync":0-100,"side":"buy" or "sell","reason":"one sentence including volume and sentiment context"}}
+Be very aggressive. confidence>30, volatility<90, sync>30 required."""
+
     res = requests.post("https://api.anthropic.com/v1/messages",
         headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
-        json={"model": "claude-haiku-4-5-20251001", "max_tokens": 150, "messages": [{"role": "user", "content": prompt}]},
+        json={"model": "claude-haiku-4-5-20251001", "max_tokens": 200, "messages": [{"role": "user", "content": prompt}]},
         timeout=20)
     text = res.json()['content'][0]['text'].replace('```json','').replace('```','').strip()
-    return json.loads(text)
+    result = json.loads(text)
+    
+    # Volume boost: if volume is 2x+ average and momentum is positive, boost confidence
+    if vol_data and vol_data['volume_ratio'] >= 2.0 and vol_data['momentum_5d'] > 0:
+        original_conf = result.get('confidence', 0)
+        result['confidence'] = min(100, original_conf + 10)
+        log_scan(f"📊 {symbol} — volume boost applied ({vol_data['volume_ratio']}x avg vol, conf: {original_conf}→{result['confidence']})")
+    
+    # Volume penalty: if volume is very low (<0.5x average), reduce confidence
+    if vol_data and vol_data['volume_ratio'] < 0.5:
+        original_conf = result.get('confidence', 0)
+        result['confidence'] = max(0, original_conf - 10)
+        log_scan(f"📊 {symbol} — low volume penalty ({vol_data['volume_ratio']}x avg vol, conf: {original_conf}→{result['confidence']})")
+    
+    # Sentiment boost: bullish news with high score boosts confidence
+    if sentiment and sentiment.get('score', 0) >= 50:
+        original_conf = result.get('confidence', 0)
+        result['confidence'] = min(100, original_conf + 10)
+        log_scan(f"📰 {symbol} — bullish sentiment boost (score:{sentiment.get('score')}, conf: {original_conf}→{result['confidence']})")
+    
+    # Sentiment penalty: bearish news reduces confidence
+    elif sentiment and sentiment.get('score', 0) <= -50:
+        original_conf = result.get('confidence', 0)
+        result['confidence'] = max(0, original_conf - 10)
+        log_scan(f"📰 {symbol} — bearish sentiment penalty (score:{sentiment.get('score')}, conf: {original_conf}→{result['confidence']})")
+    
+    return result
 
 def auto_scan():
     reset_if_needed()
@@ -340,6 +516,21 @@ def congress_scan():
         if bought >= 3:
             break
 
+        # FIX: enforce the same max-shares-per-stock cap the Auto Engine uses.
+        # Without this check, congress_scan() kept re-buying the fallback
+        # tickers (NVDA/MSFT/AAPL/AMZN/GOOGL) day after day with no regard
+        # for existing position size, since trade_key only blocks the same
+        # ticker on the same calendar day — not across days.
+        try:
+            pos_res = requests.get(f"{ALPACA_BASE_URL}/positions/{ticker}", headers=alpaca_hdrs(), timeout=10)
+            current_qty = int(float(pos_res.json().get('qty', 0))) if pos_res.ok else 0
+        except:
+            current_qty = 0
+
+        if current_qty >= RULES['maxSharesPerStock']:
+            log_congress(f"⏭ {ticker} — max {RULES['maxSharesPerStock']} shares held, skipping")
+            continue
+
         try:
             qr = requests.get(f"{ALPACA_DATA_URL}/stocks/{ticker}/trades/latest", headers=alpaca_hdrs(), timeout=10)
             if not qr.ok:
@@ -348,8 +539,14 @@ def congress_scan():
             if not price or price < 1 or price > 1000:
                 continue
 
-            qty = max(1, int(RULES['maxPositionSize'] / price))
-            log_congress(f"📋 Copying congressional BUY: {ticker} @ ${price:.2f}")
+            # Cap the buy quantity so we never cross maxSharesPerStock,
+            # even when maxPositionSize / price would normally buy more.
+            room_left = RULES['maxSharesPerStock'] - current_qty
+            qty = max(1, min(room_left, int(RULES['maxPositionSize'] / price)))
+            if qty <= 0:
+                continue
+
+            log_congress(f"📋 Copying congressional BUY: {ticker} @ ${price:.2f} (holding {current_qty}/{RULES['maxSharesPerStock']})")
 
             or_ = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(),
                 json={"symbol": ticker, "qty": str(qty), "side": "buy", "type": "market", "time_in_force": "day"}, timeout=10)
@@ -387,6 +584,7 @@ def index():
     return jsonify({"app": "Precision Alpha AI Backend", "status": "running", "mode": "paper-only"})
 
 @app.route("/api/engine/start", methods=["POST"])
+@require_api_key
 def start_engine():
     if not engine_state['running']:
         engine_state['running'] = True
@@ -395,12 +593,14 @@ def start_engine():
     return jsonify({"status": "running"})
 
 @app.route("/api/engine/stop", methods=["POST"])
+@require_api_key
 def stop_engine():
     engine_state['running'] = False
     log_scan("⏹ Auto engine stopped")
     return jsonify({"status": "stopped"})
 
 @app.route("/api/engine/kill", methods=["POST"])
+@require_api_key
 def kill_engine():
     engine_state['running'] = False
     congress_state['running'] = False
@@ -429,6 +629,7 @@ def congress_status():
     })
 
 @app.route("/api/congress/start", methods=["POST"])
+@require_api_key
 def start_congress():
     if not congress_state['running']:
         congress_state['running'] = True
@@ -437,12 +638,14 @@ def start_congress():
     return jsonify({"status": "running"})
 
 @app.route("/api/congress/stop", methods=["POST"])
+@require_api_key
 def stop_congress():
     congress_state['running'] = False
     log_congress("⏹ Congressional copy engine stopped")
     return jsonify({"status": "stopped"})
 
 @app.route("/api/congress/scan", methods=["POST"])
+@require_api_key
 def manual_congress_scan():
     congress_state['last_scan'] = ''
     threading.Thread(target=congress_scan, daemon=True).start()
@@ -478,6 +681,14 @@ def get_positions():
 
 @app.route("/api/orders", methods=["GET","POST"])
 def orders():
+    # Only the POST side (placing an order) needs the key — GET (reading
+    # order history) stays open like the other read-only routes.
+    if request.method == "POST":
+        if API_KEY:
+            if request.headers.get("X-API-Key", "") != API_KEY:
+                return jsonify({"error": "unauthorized"}), 401
+        else:
+            logger.warning("⚠️ API_KEY not set — POST /api/orders is UNPROTECTED")
     try:
         if request.method == "POST":
             res = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(), json=request.get_json(), timeout=10)
@@ -504,6 +715,7 @@ def get_settings():
     return jsonify(RULES)
 
 @app.route("/api/settings/update", methods=["POST"])
+@require_api_key
 def update_settings():
     data = request.get_json()
     allowed = ['maxDailyLoss','maxTrades','maxPositionSize','maxLossPerTrade',

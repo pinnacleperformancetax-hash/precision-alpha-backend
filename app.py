@@ -112,13 +112,33 @@ def get_week_key():
     d = datetime.now(pytz.timezone('America/New_York'))
     return f"{d.year}-W{d.isocalendar()[1]}"
 
+_clock_cache = {'ts': 0.0, 'is_open': None}
+
 def is_market_hours():
+    """True only when the market is actually open.
+
+    Previously this only compared the clock to 9:30-16:00 and never checked the
+    day of the week, so the engines "traded" all weekend: orders queued while the
+    market was closed, then all filled at Monday's open at once. Now it asks
+    Alpaca's market clock (handles weekends AND holidays), cached for 60s, and
+    falls back to a weekday-aware local check if the clock call fails."""
+    now = time.time()
+    if _clock_cache['is_open'] is not None and now - _clock_cache['ts'] < 60:
+        return _clock_cache['is_open']
+    try:
+        r = requests.get(f"{ALPACA_BASE_URL}/clock", headers=alpaca_hdrs(), timeout=5)
+        if r.ok:
+            is_open = bool(r.json().get('is_open'))
+            _clock_cache['ts'] = now
+            _clock_cache['is_open'] = is_open
+            return is_open
+    except Exception as e:
+        logger.warning(f"Alpaca clock lookup failed, using local fallback: {e}")
     est = datetime.now(pytz.timezone('America/New_York'))
+    if est.weekday() >= 5:  # Saturday/Sunday
+        return False
     h, m = est.hour, est.minute
-    # 9:30am to 4:00pm EST
-    after_open = (h > 9 or (h == 9 and m >= 30))
-    before_close = (h < 16)
-    return after_open and before_close
+    return (h > 9 or (h == 9 and m >= 30)) and h < 16
 
 def reset_if_needed():
     today = datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d')
@@ -152,6 +172,37 @@ def get_real_today_pl():
 
 def alpaca_hdrs():
     return {'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET, 'Content-Type': 'application/json'}
+
+def get_exposure(symbol):
+    """Returns (held_qty, pending_buy_qty, pending_sell_qty) for a symbol, or
+    None if Alpaca can't be reached (callers must then SKIP the trade).
+
+    The old cap check only looked at filled shares, so orders that were queued
+    but not yet filled were invisible: every scan saw "holding 0/5" and bought
+    again. held_qty is signed (negative = short)."""
+    held = 0
+    try:
+        r = requests.get(f"{ALPACA_BASE_URL}/positions/{symbol}", headers=alpaca_hdrs(), timeout=10)
+        if r.status_code == 404:
+            held = 0
+        elif r.ok:
+            held = int(float(r.json().get('qty', 0)))
+        else:
+            return None
+        o = requests.get(f"{ALPACA_BASE_URL}/orders?status=open&symbols={symbol}&limit=100", headers=alpaca_hdrs(), timeout=10)
+        if not o.ok:
+            return None
+        pending_buy = pending_sell = 0
+        for order in o.json():
+            q = int(float(order.get('qty') or 0))
+            if order.get('side') == 'buy':
+                pending_buy += q
+            elif order.get('side') == 'sell':
+                pending_sell += q
+        return held, pending_buy, pending_sell
+    except Exception as e:
+        logger.error(f"Exposure lookup failed for {symbol}: {e}")
+        return None
 
 def log_scan(msg):
     est = datetime.now(pytz.timezone('America/New_York'))
@@ -245,6 +296,11 @@ def check_and_sell_positions():
             current_price = float(pos.get('current_price', 0))
 
             if qty == 0:
+                continue
+            if float(pos.get('qty', 0)) < 0:
+                # Short positions: the stop-loss/take-profit math below assumes a long
+                # and would SELL more (doubling the short). Shorting is disabled; cover manually.
+                log_scan(f"⚠️ {symbol} — short position ({pos.get('qty')}), skipping auto-sell; cover manually")
                 continue
 
             should_sell = False
@@ -509,16 +565,27 @@ def auto_scan():
             if conf < RULES['minConfidence'] or vol > RULES['maxVolatility'] or sync < RULES['minSyncScore']:
                 log_scan(f"⚫ {symbol} — blocked (C:{conf} V:{vol} S:{sync})"); continue
 
-            # Check current position size — max 5 shares per stock
-            try:
-                pos_res = requests.get(f"{ALPACA_BASE_URL}/positions/{symbol}", headers=alpaca_hdrs(), timeout=10)
-                current_qty = int(float(pos_res.json().get('qty', 0))) if pos_res.ok else 0
-            except:
-                current_qty = 0
+            # Position/exposure check. Counts pending (unfilled) orders, and never
+            # opens shorts: this app only buys, and sells only shares it holds.
+            exposure = get_exposure(symbol)
+            if exposure is None:
+                log_scan(f"⏭ {symbol} — couldn't verify position/open orders, skipping"); continue
+            held, pending_buy, pending_sell = exposure
 
-            if current_qty >= RULES['maxSharesPerStock']:
-                log_scan(f"⏭ {symbol} — max {RULES['maxSharesPerStock']} shares held, skipping")
-                continue
+            if side == 'sell':
+                sellable = held - pending_sell
+                if sellable <= 0:
+                    log_scan(f"⏭ {symbol} — SELL signal but no long shares to sell (shorting disabled), skipping")
+                    continue
+                current_qty = held
+            else:
+                current_qty = max(held, 0) + pending_buy  # effective exposure incl. queued orders
+                if held < 0:
+                    log_scan(f"⏭ {symbol} — short position open ({held}), skipping buys until it's covered")
+                    continue
+                if current_qty >= RULES['maxSharesPerStock']:
+                    log_scan(f"⏭ {symbol} — max {RULES['maxSharesPerStock']} shares held/pending, skipping")
+                    continue
 
             qty = 1  # Always buy 1 share at a time
             log_scan(f"✅ {symbol} — {side.upper()} signal. Placing... (holding {current_qty}/{RULES['maxSharesPerStock']})")
@@ -663,14 +730,18 @@ def congress_scan():
         # tickers (NVDA/MSFT/AAPL/AMZN/GOOGL) day after day with no regard
         # for existing position size, since trade_key only blocks the same
         # ticker on the same calendar day — not across days.
-        try:
-            pos_res = requests.get(f"{ALPACA_BASE_URL}/positions/{ticker}", headers=alpaca_hdrs(), timeout=10)
-            current_qty = int(float(pos_res.json().get('qty', 0))) if pos_res.ok else 0
-        except:
-            current_qty = 0
+        exposure = get_exposure(ticker)
+        if exposure is None:
+            log_congress(f"⏭ {ticker} — couldn't verify position/open orders, skipping")
+            continue
+        held, pending_buy, _pending_sell = exposure
+        if held < 0:
+            log_congress(f"⏭ {ticker} — short position open ({held}), skipping")
+            continue
+        current_qty = held + pending_buy  # effective exposure incl. queued orders
 
         if current_qty >= RULES['maxSharesPerStock']:
-            log_congress(f"⏭ {ticker} — max {RULES['maxSharesPerStock']} shares held, skipping")
+            log_congress(f"⏭ {ticker} — max {RULES['maxSharesPerStock']} shares held/pending, skipping")
             continue
 
         try:

@@ -887,6 +887,44 @@ def get_bars(symbol):
         return jsonify(res.json()), res.status_code
     except Exception as e: return jsonify({"error": str(e)}), 500
 
+# ---- Options: Step 1 (contract lookup only, no order placement yet) ----
+# GET /v2/options/contracts is a TRADING API endpoint (same host as /v2/orders
+# and /v2/positions), not the market-data host — hence ALPACA_BASE_URL here,
+# same as everything else in this file, not ALPACA_DATA_URL.
+@app.route("/api/options/contracts/<symbol>")
+def get_option_contracts(symbol):
+    """Browse available option contracts for an underlying symbol.
+    Query params (all optional, passed straight through to Alpaca):
+      expiration_date (YYYY-MM-DD), expiration_date_gte, expiration_date_lte,
+      type (call/put), strike_price_gte, strike_price_lte, limit, page_token
+    Alpaca's default (no expiration filter) only returns contracts expiring
+    by the upcoming weekend, so the frontend should let the person pick a
+    date range rather than relying on that default for anything useful.
+    """
+    try:
+        params = {"underlying_symbols": symbol.upper()}
+        passthrough = ['expiration_date', 'expiration_date_gte', 'expiration_date_lte',
+                        'type', 'strike_price_gte', 'strike_price_lte', 'limit', 'page_token', 'status']
+        for key in passthrough:
+            val = request.args.get(key)
+            if val:
+                params[key] = val
+        res = requests.get(f"{ALPACA_BASE_URL}/options/contracts", headers=alpaca_hdrs(), params=params, timeout=15)
+        return jsonify(res.json()), res.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/options/contracts/lookup/<contract_symbol>")
+def get_single_option_contract(contract_symbol):
+    """Fetch one contract's full details by its OCC symbol (or Alpaca's
+    internal contract id) — used once a specific strike/expiration is picked,
+    to confirm it's tradable before building an order leg from it."""
+    try:
+        res = requests.get(f"{ALPACA_BASE_URL}/options/contracts/{contract_symbol}", headers=alpaca_hdrs(), timeout=10)
+        return jsonify(res.json()), res.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/quote/<symbol>")
 def get_quote(symbol):
     try:

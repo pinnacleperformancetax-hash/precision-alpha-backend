@@ -925,6 +925,57 @@ def get_single_option_contract(contract_symbol):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/options/orders", methods=["POST"])
+@require_api_key
+def place_option_order():
+    """Step 2: single-leg option orders only (buy/sell one call or put).
+    Multi-leg (order_class: mleg) spreads are Step 3 — not built yet.
+
+    A single-leg option order uses the SAME /v2/orders endpoint as stock
+    orders — Alpaca tells equity and option orders apart by the symbol
+    format (a ticker like 'AAPL' vs a 21-char OCC symbol like
+    'AAPL260928C00250000'), so no order_class or position_intent is needed
+    here, same as a plain stock buy/sell.
+    """
+    try:
+        data = request.get_json() or {}
+        contract_symbol = data.get('symbol', '').strip()
+        side = str(data.get('side', '')).lower()
+        qty = data.get('qty')
+        order_type = data.get('type', 'market')
+        limit_price = data.get('limit_price')
+
+        if not contract_symbol or len(contract_symbol) < 15:
+            return jsonify({"error": "Missing or invalid option contract symbol (expected OCC format)"}), 400
+        if side not in ('buy', 'sell'):
+            return jsonify({"error": "side must be 'buy' or 'sell'"}), 400
+        try:
+            qty = int(qty)
+            if qty <= 0:
+                raise ValueError()
+        except (TypeError, ValueError):
+            return jsonify({"error": "qty must be a positive integer (number of contracts)"}), 400
+
+        order_payload = {
+            "symbol": contract_symbol, "qty": str(qty), "side": side,
+            "type": order_type, "time_in_force": "day"
+        }
+        if order_type == 'limit':
+            if not limit_price:
+                return jsonify({"error": "limit_price is required for limit orders"}), 400
+            order_payload["limit_price"] = str(limit_price)
+
+        res = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(), json=order_payload, timeout=10)
+        if res.ok:
+            entry = f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · OPTION {side.upper()} {qty}x {contract_symbol}"
+            engine_state['trade_log'].insert(0, entry)
+            engine_state['trade_log'] = engine_state['trade_log'][:50]
+            save_state()
+            log_scan(f"🎯 OPTION ORDER PLACED: {side.upper()} {qty}x {contract_symbol}")
+        return jsonify(res.json()), res.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/quote/<symbol>")
 def get_quote(symbol):
     try:

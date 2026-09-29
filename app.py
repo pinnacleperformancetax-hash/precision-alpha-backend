@@ -1151,6 +1151,83 @@ def place_option_order():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/options/orders/multi-leg", methods=["POST"])
+@require_api_key
+def place_multi_leg_option_order():
+    """Step 3: multi-leg spreads (e.g. buy one call, sell another — a
+    vertical spread) submitted as ONE atomic order via order_class: 'mleg'.
+
+    Unlike single-leg orders, Alpaca requires this on a distinct payload
+    shape: a top-level qty (how many of the whole spread combo to trade,
+    usually 1) plus a 'legs' array where each leg carries its OWN symbol,
+    side, ratio_qty (how that leg scales relative to the top-level qty —
+    almost always 1 for a simple 2-leg spread), and position_intent
+    ('buy_to_open'/'sell_to_open' for a new spread). All legs fill together
+    or the whole order is rejected — there's no partial-spread state.
+
+    Expected request body:
+      { "legs": [ {"symbol": "...", "side": "buy"}, {"symbol": "...", "side": "sell"} ],
+        "qty": 1, "type": "market", "limit_price": optional }
+    """
+    try:
+        data = request.get_json() or {}
+        legs_in = data.get('legs', [])
+        qty = data.get('qty', 1)
+        order_type = data.get('type', 'market')
+        limit_price = data.get('limit_price')
+
+        if not isinstance(legs_in, list) or len(legs_in) < 2 or len(legs_in) > 4:
+            return jsonify({"error": "legs must be a list of 2-4 contracts"}), 400
+        try:
+            qty = int(qty)
+            if qty <= 0:
+                raise ValueError()
+        except (TypeError, ValueError):
+            return jsonify({"error": "qty must be a positive integer"}), 400
+
+        legs_payload = []
+        for i, leg in enumerate(legs_in):
+            symbol = str(leg.get('symbol', '')).strip()
+            side = str(leg.get('side', '')).lower()
+            ratio_qty = leg.get('ratio_qty', 1)
+            if not symbol or len(symbol) < 15:
+                return jsonify({"error": f"Leg {i+1}: missing or invalid OCC contract symbol"}), 400
+            if side not in ('buy', 'sell'):
+                return jsonify({"error": f"Leg {i+1}: side must be 'buy' or 'sell'"}), 400
+            try:
+                ratio_qty = int(ratio_qty)
+                if ratio_qty <= 0:
+                    raise ValueError()
+            except (TypeError, ValueError):
+                return jsonify({"error": f"Leg {i+1}: ratio_qty must be a positive integer"}), 400
+            legs_payload.append({
+                "symbol": symbol, "side": side, "ratio_qty": str(ratio_qty),
+                "position_intent": "buy_to_open" if side == "buy" else "sell_to_open",
+            })
+
+        order_payload = {
+            "order_class": "mleg", "qty": str(qty), "type": order_type,
+            "time_in_force": "day", "legs": legs_payload,
+        }
+        if order_type == 'limit':
+            if not limit_price:
+                return jsonify({"error": "limit_price is required for limit orders"}), 400
+            order_payload["limit_price"] = str(limit_price)
+
+        res = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(), json=order_payload, timeout=10)
+        if res.ok:
+            leg_desc = ' / '.join(f"{l['side'].upper()} {l['symbol']}" for l in legs_payload)
+            entry = f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · SPREAD ({qty}x): {leg_desc}"
+            engine_state['trade_log'].insert(0, entry)
+            engine_state['trade_log'] = engine_state['trade_log'][:50]
+            save_state()
+            log_scan(f"🎯🎯 MULTI-LEG ORDER PLACED: {leg_desc}")
+        else:
+            logger.error(f"Multi-leg order rejected: HTTP {res.status_code} — {res.text[:300]}")
+        return jsonify(res.json()), res.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 # ---- Options: Edge Score scanner ----
 # This is a DETERMINISTIC heuristic, not AI-driven and not investment advice.
 # It scores near-the-money contracts on three things, each 0-100:

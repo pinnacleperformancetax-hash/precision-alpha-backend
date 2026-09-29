@@ -19,6 +19,12 @@ ALPACA_KEY        = os.environ.get("ALPACA_KEY", "")
 ALPACA_SECRET     = os.environ.get("ALPACA_SECRET", "")
 ALPACA_BASE_URL   = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets/v2")
 ALPACA_DATA_URL   = "https://data.alpaca.markets/v2"
+# Options market data (quotes, greeks, implied volatility) lives under a
+# different, older API version than stocks — v1beta1, not v2 — on the same
+# data.alpaca.markets host. Confirmed field names: quotes use 'bp'/'ap' for
+# bid/ask price, greeks come as {delta, gamma, rho, theta, vega}, and implied
+# volatility is a separate top-level 'impliedVolatility' field.
+ALPACA_OPTIONS_DATA_URL = "https://data.alpaca.markets/v1beta1"
 EMAILJS_SERVICE   = os.environ.get("EMAILJS_SERVICE", "service_rucosmz")
 EMAILJS_TEMPLATE  = os.environ.get("EMAILJS_TEMPLATE", "template_qajvk5t")
 EMAILJS_PUBLIC    = os.environ.get("EMAILJS_PUBLIC", "i9a72iQL0ChaDHoZL")
@@ -976,8 +982,166 @@ def place_option_order():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/api/quote/<symbol>")
-def get_quote(symbol):
+# ---- Options: Edge Score scanner ----
+# This is a DETERMINISTIC heuristic, not AI-driven and not investment advice.
+# It scores near-the-money contracts on three things, each 0-100:
+#   - liquidity_score: tighter bid/ask spread = more reliably tradable
+#   - delta_score: rewards contracts near 0.45 |delta| — meaningful leverage
+#     to the underlying's move without being so deep ITM/OTM it's basically
+#     just the stock (high delta) or basically a lottery ticket (low delta)
+#   - iv_score: rewards moderate implied volatility — very high IV means
+#     you're paying a lot for the option's time value; very low IV means
+#     little upside is priced in either way
+# The 0.45 delta and 35% IV "sweet spots" below are reasonable starting
+# points, not backtested constants — tune them once you've watched this
+# against real market behavior for a while.
+# NOTE: Alpaca's free/indicative options feed does not expose per-contract
+# daily volume (it's null), so "unusual volume today" isn't something this
+# can score on the free tier — spread + delta + IV are what's available.
+def score_option_contract(bid, ask, delta, iv):
+    if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:
+        return None  # no usable quote — exclude rather than guess
+    mid = (bid + ask) / 2
+    spread_pct = (ask - bid) / mid if mid > 0 else 1.0
+    liquidity_score = max(0, 100 - spread_pct * 100 * 5)
+
+    if delta is None:
+        delta_score = 40  # unknown — treat as below-average confidence, not zero
+    else:
+        delta_score = max(0, 100 - abs(abs(delta) - 0.45) * 200)
+
+    if iv is None:
+        iv_score = 50
+    else:
+        iv_score = max(0, 100 - abs(iv - 0.35) * 150)
+
+    edge_score = round(liquidity_score * 0.4 + delta_score * 0.35 + iv_score * 0.25)
+    return {
+        'edge_score': edge_score, 'mid_price': round(mid, 2),
+        'spread_pct': round(spread_pct * 100, 1),
+        'delta': round(delta, 3) if delta is not None else None,
+        'iv': round(iv * 100, 1) if iv is not None else None,
+    }
+
+def build_option_reason(scored, contract_type):
+    parts = []
+    if scored['spread_pct'] < 5:
+        parts.append("tight spread")
+    elif scored['spread_pct'] > 15:
+        parts.append("wide spread — costly to enter/exit")
+    if scored['delta'] is not None:
+        d = abs(scored['delta'])
+        if 0.35 <= d <= 0.55:
+            parts.append(f"delta {scored['delta']} in a solid leverage range")
+        elif d > 0.55:
+            parts.append(f"delta {scored['delta']} — trades close to the stock itself")
+        else:
+            parts.append(f"delta {scored['delta']} — cheap but low odds of finishing in the money")
+    if scored['iv'] is not None:
+        if scored['iv'] > 60:
+            parts.append(f"IV {scored['iv']}% is elevated — you're paying up for it")
+        elif scored['iv'] < 20:
+            parts.append(f"IV {scored['iv']}% is low — cheaper premium")
+    return "; ".join(parts) if parts else "Limited data available for this contract."
+
+@app.route("/api/options/edge-scan")
+def options_edge_scan():
+    """Scans near-the-money contracts across a list of underlyings and
+    returns the top-scoring candidates by Edge Score. See score_option_contract
+    for exactly what's being measured and its limitations."""
+    try:
+        symbols_param = request.args.get('symbols', '')
+        symbols = [s.strip().upper() for s in symbols_param.split(',') if s.strip()] or MARKET_SCAN_LIST[:8]
+        min_days = int(request.args.get('min_days', 7))
+        max_days = int(request.args.get('max_days', 45))
+        moneyness_pct = float(request.args.get('moneyness_pct', 15))
+        top_n = int(request.args.get('top_n', 8))
+        opt_type = request.args.get('type', '')  # '', 'call', or 'put'
+
+        today = datetime.utcnow().date()
+        exp_gte = (today + timedelta(days=min_days)).isoformat()
+        exp_lte = (today + timedelta(days=max_days)).isoformat()
+
+        all_candidates = []
+        skipped = []
+
+        for symbol in symbols:
+            try:
+                pr = requests.get(f"{ALPACA_DATA_URL}/stocks/{symbol}/trades/latest", headers=alpaca_hdrs(), timeout=10)
+                price = pr.json().get('trade', {}).get('p', 0) if pr.ok else 0
+                if not price:
+                    skipped.append(f"{symbol}: no live price"); continue
+
+                strike_low = round(price * (1 - moneyness_pct / 100), 2)
+                strike_high = round(price * (1 + moneyness_pct / 100), 2)
+                params = {
+                    'underlying_symbols': symbol, 'expiration_date_gte': exp_gte,
+                    'expiration_date_lte': exp_lte, 'strike_price_gte': strike_low,
+                    'strike_price_lte': strike_high, 'limit': 90, 'status': 'active',
+                }
+                if opt_type:
+                    params['type'] = opt_type
+                cr = requests.get(f"{ALPACA_BASE_URL}/options/contracts", headers=alpaca_hdrs(), params=params, timeout=15)
+                if not cr.ok:
+                    skipped.append(f"{symbol}: contracts lookup failed"); continue
+                contracts = cr.json().get('option_contracts', [])
+                if not contracts:
+                    skipped.append(f"{symbol}: no contracts in range"); continue
+
+                contract_info = {c['symbol']: c for c in contracts}
+                contract_symbols = list(contract_info.keys())[:90]
+
+                sr = requests.get(f"{ALPACA_OPTIONS_DATA_URL}/options/snapshots",
+                                   headers=alpaca_hdrs(),
+                                   params={'symbols': ','.join(contract_symbols), 'limit': len(contract_symbols)},
+                                   timeout=15)
+                if not sr.ok:
+                    skipped.append(f"{symbol}: snapshot lookup failed ({sr.status_code})"); continue
+                snapshots = sr.json().get('snapshots', {})
+
+                for csym, snap in snapshots.items():
+                    info = contract_info.get(csym)
+                    if not info:
+                        continue
+                    quote = snap.get('latestQuote') or {}
+                    greeks = snap.get('greeks') or {}
+                    bid, ask = quote.get('bp'), quote.get('ap')
+                    delta = greeks.get('delta')
+                    iv = snap.get('impliedVolatility')
+                    try:
+                        bid = float(bid) if bid is not None else None
+                        ask = float(ask) if ask is not None else None
+                        delta = float(delta) if delta is not None else None
+                        iv = float(iv) if iv is not None else None
+                    except (TypeError, ValueError):
+                        continue
+
+                    scored = score_option_contract(bid, ask, delta, iv)
+                    if scored is None:
+                        continue
+                    all_candidates.append({
+                        'underlying': symbol, 'contract_symbol': csym,
+                        'type': info.get('type'), 'strike_price': info.get('strike_price'),
+                        'expiration_date': info.get('expiration_date'),
+                        'underlying_price': price,
+                        **scored,
+                        'reason': build_option_reason(scored, info.get('type')),
+                    })
+            except Exception as e:
+                skipped.append(f"{symbol}: {str(e)[:60]}")
+                continue
+
+        all_candidates.sort(key=lambda c: c['edge_score'], reverse=True)
+        return jsonify({
+            'candidates': all_candidates[:top_n],
+            'scanned_symbols': symbols,
+            'skipped': skipped,
+            'total_candidates_found': len(all_candidates),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
     try:
         res = requests.get(f"{ALPACA_DATA_URL}/stocks/{symbol}/trades/latest", headers=alpaca_hdrs(), timeout=10)
         return jsonify(res.json()), res.status_code

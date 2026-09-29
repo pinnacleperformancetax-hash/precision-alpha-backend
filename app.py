@@ -527,7 +527,146 @@ Be very aggressive. confidence>30, volatility<90, sync>30 required."""
         result['confidence'] = max(0, original_conf - 10)
         log_scan(f"📰 {symbol} — bearish sentiment penalty (score:{sentiment.get('score')}, conf: {original_conf}→{result['confidence']})")
     
-    return result
+    return result, vol_data, sentiment
+
+# ---- Confluence trading system: market regime + multi-signal agreement ----
+# Previously auto_scan() traded a stock purely on ONE AI confidence score.
+# This replaces that with a confluence approach: several independent
+# signals must AGREE before a buy fires, and how many must agree scales
+# with the overall market's current trend and volatility (the "regime") —
+# calmer, trending-up markets need less confirmation; choppy or declining
+# markets need more, and a confirmed downtrend blocks new buys outright.
+# This does not change congress_scan(), which is unrelated and untouched.
+
+_regime_cache = {'ts': 0.0, 'regime': None}
+
+def _sma(closes, period):
+    if len(closes) < period:
+        return None
+    return sum(closes[-period:]) / period
+
+def _rsi(closes, period=14):
+    """Standard 14-period RSI from a list of closes, oldest to newest."""
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        change = closes[i] - closes[i - 1]
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 1)
+
+def get_daily_closes(symbol, days=30):
+    """Fetch `days` of daily closes, oldest to newest. Returns [] on failure —
+    callers must treat that as 'indicator unavailable', not as zero/neutral."""
+    try:
+        end = datetime.utcnow().isoformat() + 'Z'
+        start = (datetime.utcnow() - timedelta(days=days + 5)).isoformat() + 'Z'  # pad for weekends/holidays
+        res = requests.get(
+            f"{ALPACA_DATA_URL}/stocks/{symbol}/bars?timeframe=1Day&start={start}&end={end}&limit={days+10}",
+            headers=alpaca_hdrs(), timeout=10
+        )
+        if not res.ok:
+            return []
+        bars = res.json().get('bars', [])
+        return [b['c'] for b in bars]
+    except Exception as e:
+        logger.error(f"get_daily_closes error for {symbol}: {e}")
+        return []
+
+def get_market_regime():
+    """SPY's own trend + volatility, defining how strict the confluence bar
+    is this scan cycle. Cached for 5 minutes (matches the scan interval) so
+    it's computed once per cycle, not once per stock."""
+    now = time.time()
+    if _regime_cache['regime'] is not None and now - _regime_cache['ts'] < 300:
+        return _regime_cache['regime']
+
+    closes = get_daily_closes('SPY', days=30)
+    if len(closes) < 21:
+        regime = {'trend': 'unknown', 'volatility': 'unknown', 'label': 'Unknown (insufficient SPY data)'}
+        _regime_cache['ts'] = now
+        _regime_cache['regime'] = regime
+        return regime
+
+    sma20 = _sma(closes, 20)
+    price = closes[-1]
+    trend = 'bull' if price > sma20 else 'bear'
+
+    # Daily % change volatility over the last ~14 days
+    recent = closes[-15:]
+    pct_changes = [abs((recent[i] - recent[i-1]) / recent[i-1]) for i in range(1, len(recent)) if recent[i-1]]
+    avg_daily_move = (sum(pct_changes) / len(pct_changes) * 100) if pct_changes else 0
+    if avg_daily_move < 0.7:
+        volatility = 'low'
+    elif avg_daily_move < 1.5:
+        volatility = 'normal'
+    else:
+        volatility = 'high'
+
+    label = f"{'Bull' if trend=='bull' else 'Bear'}, {volatility.capitalize()} Vol"
+    regime = {
+        'trend': trend, 'volatility': volatility, 'label': label,
+        'spy_price': round(price, 2), 'spy_sma20': round(sma20, 2),
+        'avg_daily_move_pct': round(avg_daily_move, 2),
+    }
+    _regime_cache['ts'] = now
+    _regime_cache['regime'] = regime
+    return regime
+
+def confluence_threshold_for_regime(regime):
+    """How many of the (up to 5) confluence signals must agree, and out of
+    how many, given the current regime. Returns (required, out_of) or
+    (None, None) if new buys are blocked entirely this regime.
+    These specific thresholds are a starting point, not backtested constants
+    — tune them once you've watched this run against real market days."""
+    if regime['trend'] == 'bear':
+        return None, None  # no new buys while SPY is below its own 20-day trend
+    if regime['trend'] == 'bull' and regime['volatility'] == 'low':
+        return 3, 5
+    if regime['trend'] == 'bull':  # normal or high vol
+        return 4, 5
+    return 4, 5  # unknown/neutral — be conservative
+
+def evaluate_confluence(symbol, price, ai_result, vol_data, sentiment):
+    """Scores up to 5 independent signals for one stock. Returns
+    (signals_agreeing, signals_total, detail_list) — detail_list is for
+    logging, so a blocked/allowed decision is always explainable."""
+    closes = get_daily_closes(symbol, days=30)
+    signals = []
+
+    sma20 = _sma(closes, 20) if closes else None
+    if sma20 is not None:
+        signals.append(('trend', price > sma20))
+    # else: trend signal omitted entirely (not counted for or against) —
+    # an unavailable indicator should never silently count as bearish.
+
+    rsi = _rsi(closes) if closes else None
+    if rsi is not None:
+        signals.append(('momentum', 40 <= rsi <= 70))
+
+    if vol_data and vol_data.get('volume_ratio') is not None:
+        signals.append(('volume', vol_data['volume_ratio'] > 1.2))
+
+    if sentiment and sentiment.get('score') is not None:
+        signals.append(('sentiment', sentiment['score'] >= 20))
+
+    if ai_result:
+        ai_bullish = (
+            ai_result.get('side') == 'buy'
+            and ai_result.get('confidence', 0) >= RULES['minConfidence']
+            and ai_result.get('volatility', 100) <= RULES['maxVolatility']
+            and ai_result.get('sync', 0) >= RULES['minSyncScore']
+        )
+        signals.append(('ai', ai_bullish))
+
+    agreeing = sum(1 for _, ok in signals if ok)
+    return agreeing, len(signals), signals
 
 def auto_scan():
     reset_if_needed()
@@ -544,6 +683,12 @@ def auto_scan():
 
     if RULES['maxTrades'] < 999 and len(engine_state['weekly_trades']) >= RULES['maxTrades']:
         log_scan(f"🔴 Weekly trade limit reached ({len(engine_state['weekly_trades'])}/{int(RULES['maxTrades'])}) — no new buys"); return
+
+    market_regime = get_market_regime()
+    log_scan(f"📊 Market regime: {market_regime['label']}" + (
+        f" (SPY ${market_regime['spy_price']} vs 20d SMA ${market_regime['spy_sma20']})"
+        if market_regime.get('spy_price') else ""
+    ))
 
     log_scan(f"🔍 Scanning {len(MARKET_SCAN_LIST)} stocks...")
     for symbol in MARKET_SCAN_LIST:
@@ -562,7 +707,7 @@ def auto_scan():
                 if len(bars) >= 2: price_change = bars[-1]['c'] - bars[-2]['c']
 
             try:
-                ai = quick_ai_check(symbol, price, price_change)
+                ai, vol_data, sentiment = quick_ai_check(symbol, price, price_change)
             except: continue
 
             conf, vol, sync = ai.get('confidence',0), ai.get('volatility',100), ai.get('sync',0)
@@ -570,6 +715,30 @@ def auto_scan():
 
             if conf < RULES['minConfidence'] or vol > RULES['maxVolatility'] or sync < RULES['minSyncScore']:
                 log_scan(f"⚫ {symbol} — blocked (C:{conf} V:{vol} S:{sync})"); continue
+
+            # Confluence gate: only applies to NEW BUYS. A sell signal is
+            # risk-REDUCING (closing exposure you already hold), so it isn't
+            # held to the same bar as opening a new position — it still has
+            # to clear the basic AI-quality check above, plus the "did we
+            # actually hold shares" check below.
+            if side == 'buy':
+                required, out_of = confluence_threshold_for_regime(market_regime)
+                if required is None:
+                    log_scan(f"⛔ {symbol} — buy signal ignored: market regime is {market_regime['label']}, new buys paused")
+                    continue
+                agreeing, total, detail = evaluate_confluence(symbol, price, ai, vol_data, sentiment)
+                if total == 0:
+                    log_scan(f"⏭ {symbol} — no confluence signals available, skipping"); continue
+                # Threshold is defined against a target denominator (out_of),
+                # scaled down if fewer signals were actually available this run
+                # (e.g. trend omitted for a newly-listed stock with thin history).
+                effective_required = min(required, total)
+                if agreeing < effective_required:
+                    detail_str = ', '.join(f"{name}:{'✓' if ok else '✗'}" for name, ok in detail)
+                    log_scan(f"⚫ {symbol} — confluence {agreeing}/{total} (need {effective_required}) [{detail_str}]")
+                    continue
+                detail_str = ', '.join(f"{name}:{'✓' if ok else '✗'}" for name, ok in detail)
+                log_scan(f"✅ {symbol} — confluence {agreeing}/{total} agree [{detail_str}]")
 
             # Position/exposure check. Counts pending (unfilled) orders, and never
             # opens shorts: this app only buys, and sells only shares it holds.

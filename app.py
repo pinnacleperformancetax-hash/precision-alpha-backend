@@ -1100,6 +1100,33 @@ def get_single_option_contract(contract_symbol):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/options/quote/<contract_symbol>")
+def get_option_live_quote(contract_symbol):
+    """Live bid/ask/mid for ONE option contract — used by the Risk/Reward
+    display to price a single order or a spread's net debit/credit before
+    you submit. Same v1beta1 snapshots endpoint the Edge Scanner uses,
+    just for one symbol instead of a whole scan."""
+    try:
+        res = requests.get(f"{ALPACA_OPTIONS_DATA_URL}/options/snapshots",
+                            headers=alpaca_hdrs(),
+                            params={'symbols': contract_symbol}, timeout=10)
+        if not res.ok:
+            return jsonify({"error": f"HTTP {res.status_code}"}), res.status_code
+        snap = res.json().get('snapshots', {}).get(contract_symbol)
+        if not snap:
+            return jsonify({"error": "No quote available for this contract"}), 404
+        quote = snap.get('latestQuote') or {}
+        bid, ask = quote.get('bp'), quote.get('ap')
+        try:
+            bid = float(bid) if bid is not None else None
+            ask = float(ask) if ask is not None else None
+        except (TypeError, ValueError):
+            bid = ask = None
+        mid = round((bid + ask) / 2, 4) if bid is not None and ask is not None else None
+        return jsonify({"symbol": contract_symbol, "bid": bid, "ask": ask, "mid": mid})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/options/orders", methods=["POST"])
 @require_api_key
 def place_option_order():

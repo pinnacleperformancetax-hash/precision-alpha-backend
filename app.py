@@ -55,12 +55,30 @@ RULES = {
     'maxDailyLoss': 30, 'maxTrades': 999, 'maxPositionSize': 200,
     'maxLossPerTrade': 9, 'takeProfitTarget': 30,
     'minConfidence': 30, 'maxVolatility': 90, 'minSyncScore': 30, 'maxSharesPerStock': 5, 'takeProfitPct': 15,
+    # Scale-out: tiered profit-taking instead of an all-or-nothing exit at
+    # takeProfitPct. Tier 1 and 2 sell a FRACTION of the position's original
+    # size (not current size — see engine_state['scale_state']) once each
+    # gain threshold is crossed; tier 3 always sells whatever remains. A
+    # stop-loss hit (maxLossPerTrade) still exits the FULL position
+    # immediately regardless of tiers — partial exits are for locking in
+    # gains, not for softening a loss.
+    'scaleOutTier1Pct': 5,  'scaleOutTier1Frac': 0.34,
+    'scaleOutTier2Pct': 10, 'scaleOutTier2Frac': 0.33,
+    'scaleOutTier3Pct': 15,  # sells 100% of whatever's left at this gain
 }
 
 engine_state = {
     'running': False, 'weekly_trades': [], 'today_pl': 0.0,
     'last_date': '', 'week_key': '', 'scan_log': [], 'trade_log': [],
     'last_weekly_email_week': '',
+    # Per-symbol scale-out tracking: {'SYMBOL': {'origin_qty': int, 'tiers_hit': [bool,bool]}}
+    # origin_qty is the largest size the position has reached — tier fractions
+    # are computed against it, not the shrinking current qty, so "sell 1/3"
+    # means 1/3 of the original position, not 1/3 of what's left after a
+    # previous partial sell. Rebases (and un-hits tiers) if scaling in grows
+    # the position past its previous origin_qty. Cleared entirely once a
+    # position fully closes, so a fresh entry later starts clean.
+    'scale_state': {},
 }
 
 congress_state = {
@@ -285,8 +303,32 @@ def check_and_send_weekly_email():
     save_state()
     log_scan("✉️ Weekly summary email sent")
 
+def _sell_shares(symbol, qty, current_price, reason, unrealized_pl_for_log):
+    """Places the actual sell order and records it. Shared by the stop-loss,
+    tiered scale-out, and final full-exit paths below so the order-placement
+    and logging logic isn't duplicated three times."""
+    log_scan(f"💰 {symbol} — {reason}. Selling {qty} share(s)...")
+    sell = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(),
+        json={"symbol": symbol, "qty": str(qty), "side": "sell", "type": "market", "time_in_force": "day"}, timeout=10)
+    if sell.ok:
+        log_scan(f"✅ SOLD {qty} {symbol} @ ${current_price:.2f} | {reason}")
+        entry = f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · AUTO SELL: {qty} {symbol} @ ${current_price:.2f} | {reason}"
+        engine_state['trade_log'].insert(0, entry)
+        engine_state['trade_log'] = engine_state['trade_log'][:50]
+        engine_state['today_pl'] += unrealized_pl_for_log
+        save_state()
+        return True
+    else:
+        log_scan(f"❌ Failed to sell {symbol}")
+        return False
+
 def check_and_sell_positions():
-    """Auto-sell positions that hit take profit or stop loss"""
+    """Stop-loss (full exit, unchanged) + tiered scale-out on profit (NEW):
+    instead of one all-or-nothing take-profit at takeProfitPct, sells a
+    fraction of the position at each of two earlier gain thresholds, then
+    exits whatever remains at the final threshold. See RULES's
+    scaleOutTier*Pct/Frac comment for the exact thresholds and engine_state's
+    'scale_state' comment for how origin_qty/tiers_hit tracking works."""
     try:
         res = requests.get(f"{ALPACA_BASE_URL}/positions", headers=alpaca_hdrs(), timeout=10)
         if not res.ok:
@@ -295,52 +337,73 @@ def check_and_sell_positions():
         if not positions:
             return
 
+        held_symbols = set()
         for pos in positions:
             symbol = pos.get('symbol')
             qty = abs(int(float(pos.get('qty', 0))))
-            unrealized_pl = float(pos.get('unrealized_pl', 0))
             current_price = float(pos.get('current_price', 0))
 
             if qty == 0:
                 continue
             if float(pos.get('qty', 0)) < 0:
-                # Short positions: the stop-loss/take-profit math below assumes a long
-                # and would SELL more (doubling the short). Shorting is disabled; cover manually.
+                # Short positions: this logic assumes a long and would SELL
+                # more (doubling the short). Shorting is disabled; cover manually.
                 log_scan(f"⚠️ {symbol} — short position ({pos.get('qty')}), skipping auto-sell; cover manually")
                 continue
+            held_symbols.add(symbol)
 
-            should_sell = False
-            reason = ''
-
-            # Calculate per-share P&L
-            qty_pos = abs(int(float(pos.get('qty', 1))))
             avg_entry = float(pos.get('avg_entry_price', 0))
-            current_price = float(pos.get('current_price', 0))
             per_share_pl = current_price - avg_entry if avg_entry > 0 else 0
             pct_gain = ((current_price - avg_entry) / avg_entry * 100) if avg_entry > 0 else 0
+            unrealized_pl = float(pos.get('unrealized_pl', 0))
 
+            # --- Stop loss: unchanged, full immediate exit, clears scale tracking ---
             if per_share_pl <= -RULES['maxLossPerTrade']:
-                should_sell = True
                 reason = f"Stop loss: ${per_share_pl:.2f}/share ({pct_gain:.1f}%)"
-            elif pct_gain >= RULES['takeProfitPct']:
-                should_sell = True
-                reason = f"Take profit: +${per_share_pl:.2f}/share (+{pct_gain:.1f}%)"
-
-            if should_sell:
-                log_scan(f"💰 {symbol} — {reason}. Selling {qty} shares...")
-                sell = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(),
-                    json={"symbol": symbol, "qty": str(qty), "side": "sell", "type": "market", "time_in_force": "day"}, timeout=10)
-                if sell.ok:
-                    log_scan(f"✅ SOLD {qty} {symbol} @ ${current_price:.2f} | P&L: ${unrealized_pl:.2f}")
-                    entry = f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · AUTO SELL: {qty} {symbol} @ ${current_price:.2f} | {reason}"
-                    engine_state['trade_log'].insert(0, entry)
-                    engine_state['trade_log'] = engine_state['trade_log'][:50]
-                    engine_state['today_pl'] += unrealized_pl
+                if _sell_shares(symbol, qty, current_price, reason, unrealized_pl):
+                    engine_state['scale_state'].pop(symbol, None)
                     save_state()
-                    # No per-trade email — see check_and_send_weekly_email(); this
-                    # still shows up in the weekly summary via trade_log if desired.
-                else:
-                    log_scan(f"❌ Failed to sell {symbol}")
+                continue
+
+            # --- Tiered scale-out on profit ---
+            st = engine_state['scale_state'].setdefault(symbol, {'origin_qty': qty, 'tiers_hit': [False, False]})
+            if qty > st['origin_qty']:
+                # Position grew (scaled in further) past its previous high —
+                # rebase tier fractions to the new size and re-arm both tiers.
+                st['origin_qty'] = qty
+                st['tiers_hit'] = [False, False]
+
+            tier_defs = [
+                (RULES['scaleOutTier1Pct'], RULES['scaleOutTier1Frac']),
+                (RULES['scaleOutTier2Pct'], RULES['scaleOutTier2Frac']),
+            ]
+            for i, (tier_pct, tier_frac) in enumerate(tier_defs):
+                if st['tiers_hit'][i] or pct_gain < tier_pct:
+                    continue
+                sell_qty = min(qty, max(1, round(st['origin_qty'] * tier_frac)))
+                reason = f"Scale-out tier {i+1}: +{pct_gain:.1f}% (selling {int(tier_frac*100)}% of original {st['origin_qty']})"
+                if _sell_shares(symbol, sell_qty, current_price, reason, unrealized_pl * (sell_qty / qty)):
+                    st['tiers_hit'][i] = True
+                    save_state()
+                break  # one tier action per scan — re-evaluate remaining qty next cycle
+
+            # --- Final tier: exit whatever remains ---
+            # Re-fetch qty is not needed here since a same-cycle partial sell
+            # above already `break`s before reaching this — final-tier check
+            # runs on next cycle's fresh position data, seeing the reduced qty.
+            if pct_gain >= RULES['scaleOutTier3Pct']:
+                reason = f"Scale-out final: +{pct_gain:.1f}%/share, closing remaining {qty}"
+                if _sell_shares(symbol, qty, current_price, reason, unrealized_pl):
+                    engine_state['scale_state'].pop(symbol, None)
+                    save_state()
+
+        # Clean up tracking for anything no longer held at all (fully closed
+        # by a manual sell, a stop-loss above, or the final tier above).
+        stale = [s for s in engine_state['scale_state'] if s not in held_symbols]
+        if stale:
+            for s in stale:
+                engine_state['scale_state'].pop(s, None)
+            save_state()
     except Exception as e:
         logger.error(f"Auto-sell error: {e}")
 
@@ -763,7 +826,16 @@ def auto_scan():
                     continue
 
             qty = 1  # Always buy 1 share at a time
-            log_scan(f"✅ {symbol} — {side.upper()} signal. Placing... (holding {current_qty}/{RULES['maxSharesPerStock']})")
+            # A buy on a symbol already holding shares IS scaling in — it's
+            # only allowed to reach here because the SAME confluence bar that
+            # gates a brand-new position agreed again on this later scan (see
+            # the confluence gate above, which applies uniformly to every
+            # buy regardless of current_qty). maxSharesPerStock is the
+            # ultimate cap on how far scaling in can go — no separate
+            # "max adds per day" counter, since that cap already bounds it.
+            is_scale_in = side == 'buy' and current_qty > 0
+            action_label = 'SCALING IN' if is_scale_in else ('NEW POSITION' if side == 'buy' else 'SELL')
+            log_scan(f"✅ {symbol} — {side.upper()} signal ({action_label}). Placing... (holding {current_qty}/{RULES['maxSharesPerStock']})")
 
             or_ = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(),
                 json={"symbol": symbol, "qty": str(qty), "side": side, "type": "market", "time_in_force": "day"}, timeout=10)
@@ -771,11 +843,11 @@ def auto_scan():
                 log_scan(f"❌ {symbol} — order failed"); continue
 
             engine_state['weekly_trades'].append({'symbol': symbol, 'side': side, 'qty': qty, 'price': price, 'source': 'auto'})
-            entry = f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · AUTO: {side.upper()} {qty} {symbol} @ ${price:.2f} · {reason}"
+            entry = f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · AUTO {action_label}: {side.upper()} {qty} {symbol} @ ${price:.2f} · {reason}"
             engine_state['trade_log'].insert(0, entry)
             engine_state['trade_log'] = engine_state['trade_log'][:50]
             save_state()
-            log_scan(f"🚀 ORDER PLACED: {side.upper()} {qty} {symbol} @ ${price:.2f}")
+            log_scan(f"🚀 ORDER PLACED ({action_label}): {side.upper()} {qty} {symbol} @ ${price:.2f}")
             # No per-trade email — see check_and_send_weekly_email().
             break
         except Exception as e:
@@ -1491,7 +1563,8 @@ def update_settings():
     data = request.get_json()
     allowed = ['maxDailyLoss','maxTrades','maxPositionSize','maxLossPerTrade',
                'takeProfitTarget','minConfidence','maxVolatility','minSyncScore',
-               'maxSharesPerStock','takeProfitPct']
+               'maxSharesPerStock','takeProfitPct',
+               'scaleOutTier1Pct','scaleOutTier1Frac','scaleOutTier2Pct','scaleOutTier2Frac','scaleOutTier3Pct']
     updated = {}
     for key in allowed:
         if key in data:

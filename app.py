@@ -626,17 +626,28 @@ def _rsi(closes, period=14):
 
 def get_daily_closes(symbol, days=30):
     """Fetch `days` of daily closes, oldest to newest. Returns [] on failure —
-    callers must treat that as 'indicator unavailable', not as zero/neutral."""
+    callers must treat that as 'indicator unavailable', not as zero/neutral.
+    Explicitly requests the 'iex' feed: Alpaca's free-tier data plan defaults
+    to requiring an explicit feed for some bar queries, and without it some
+    requests silently come back empty (200 OK, zero bars) rather than erroring
+    — which is exactly what was happening here: every confluence trend/
+    momentum signal, and the whole market-regime check, were silently
+    unavailable on 2026-10-02 because of this, leaving only sentiment+ai as
+    the only two signals ever scored, which trivially passed 2/2 every time."""
     try:
         end = datetime.utcnow().isoformat() + 'Z'
         start = (datetime.utcnow() - timedelta(days=days + 5)).isoformat() + 'Z'  # pad for weekends/holidays
         res = requests.get(
-            f"{ALPACA_DATA_URL}/stocks/{symbol}/bars?timeframe=1Day&start={start}&end={end}&limit={days+10}",
+            f"{ALPACA_DATA_URL}/stocks/{symbol}/bars",
+            params={'timeframe': '1Day', 'start': start, 'end': end, 'limit': days + 10, 'feed': 'iex'},
             headers=alpaca_hdrs(), timeout=10
         )
         if not res.ok:
+            logger.error(f"get_daily_closes HTTP error for {symbol}: {res.status_code} — {res.text[:300]}")
             return []
         bars = res.json().get('bars', [])
+        if not bars:
+            logger.warning(f"get_daily_closes returned 0 bars for {symbol} (HTTP {res.status_code}, body: {res.text[:200]})")
         return [b['c'] for b in bars]
     except Exception as e:
         logger.error(f"get_daily_closes error for {symbol}: {e}")

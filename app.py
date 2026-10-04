@@ -71,6 +71,13 @@ engine_state = {
     'running': False, 'weekly_trades': [], 'today_pl': 0.0,
     'last_date': '', 'week_key': '', 'scan_log': [], 'trade_log': [],
     'last_weekly_email_week': '',
+    # Plain-language version of the scan_log, for customers rather than
+    # debugging. scan_log stays exactly as-is (engineer-readable, e.g.
+    # "confluence 3/4 agree [trend:✓, momentum:✗...]") since that detail has
+    # been genuinely useful for real debugging. This is a parallel, friendlier
+    # feed populated only at genuinely decision-relevant moments (a trade
+    # placed, or a meaningful block) — not every intermediate skip reason.
+    'customer_feed': [],
     # Per-symbol scale-out tracking: {'SYMBOL': {'origin_qty': int, 'tiers_hit': [bool,bool]}}
     # origin_qty is the largest size the position has reached — tier fractions
     # are computed against it, not the shrinking current qty, so "sell 1/3"
@@ -235,6 +242,43 @@ def log_scan(msg):
     engine_state['scan_log'] = engine_state['scan_log'][:50]
     logger.info(msg)
 
+def log_customer(msg):
+    """Plain-language feed entry — see engine_state['customer_feed'] comment."""
+    est = datetime.now(pytz.timezone('America/New_York'))
+    entry = f"{est.strftime('%I:%M %p')} — {msg}"
+    engine_state['customer_feed'].insert(0, entry)
+    engine_state['customer_feed'] = engine_state['customer_feed'][:50]
+
+# ---- Plain-language templates for customer-facing explanations ----
+# Each takes the same data the technical log already has and turns it into
+# a sentence a non-technical user can actually read and trust, rather than
+# engineer shorthand like "confluence 3/4 [trend:✓, momentum:✗...]".
+def explain_confluence_pass(symbol, agreeing, total, action_label, regime_label):
+    signal_word = "signal" if agreeing == 1 else "signals"
+    if action_label == 'SCALING IN':
+        return f"📈 {symbol} — Added to the position. {agreeing} of {total} {signal_word} confirmed again, so we're building up gradually instead of all at once."
+    return f"🆕 {symbol} — New position opened. {agreeing} of {total} {signal_word} lined up ({regime_label} market)."
+
+def explain_confluence_block(symbol, agreeing, total, required, regime_label):
+    signal_word = "signal" if total == 1 else "signals"
+    return f"⏸ {symbol} — Skipped for now. Only {agreeing} of {total} {signal_word} confirmed (needed {required}), and conditions are {regime_label.lower()}. Waiting for stronger agreement."
+
+def explain_regime_blocked(symbol, regime_label):
+    return f"🛑 {symbol} — Buy signal ignored. The overall market is trending down right now ({regime_label}), so we're not opening new positions until it recovers."
+
+def explain_sell_signal(symbol, qty):
+    return f"📉 {symbol} — Sold {qty} share(s). The AI's read on this one turned negative."
+
+def explain_stop_loss(symbol, qty, pct_gain):
+    return f"🛑 {symbol} — Closed the position ({qty} shares). It dropped past your loss limit ({pct_gain:.1f}%), so we exited to protect your capital."
+
+def explain_scale_out_tier(symbol, sell_qty, pct_gain, tier_num):
+    ordinal = {1: "first", 2: "second"}.get(tier_num, str(tier_num))
+    return f"💰 {symbol} — Took some profit. Sold {sell_qty} share(s) after a +{pct_gain:.1f}% gain (the {ordinal} profit-taking step) — locking in gains while letting the rest of the position ride."
+
+def explain_scale_out_final(symbol, qty, pct_gain):
+    return f"✅ {symbol} — Closed out the rest of the position ({qty} shares) at +{pct_gain:.1f}% gain. Full profit locked in."
+
 def log_congress(msg):
     est = datetime.now(pytz.timezone('America/New_York'))
     entry = f"{est.strftime('%I:%M:%S %p')} — {msg}"
@@ -362,6 +406,7 @@ def check_and_sell_positions():
                 reason = f"Stop loss: ${per_share_pl:.2f}/share ({pct_gain:.1f}%)"
                 if _sell_shares(symbol, qty, current_price, reason, unrealized_pl):
                     engine_state['scale_state'].pop(symbol, None)
+                    log_customer(explain_stop_loss(symbol, qty, pct_gain))
                     save_state()
                 continue
 
@@ -384,6 +429,7 @@ def check_and_sell_positions():
                 reason = f"Scale-out tier {i+1}: +{pct_gain:.1f}% (selling {int(tier_frac*100)}% of original {st['origin_qty']})"
                 if _sell_shares(symbol, sell_qty, current_price, reason, unrealized_pl * (sell_qty / qty)):
                     st['tiers_hit'][i] = True
+                    log_customer(explain_scale_out_tier(symbol, sell_qty, pct_gain, i + 1))
                     save_state()
                 break  # one tier action per scan — re-evaluate remaining qty next cycle
 
@@ -395,6 +441,7 @@ def check_and_sell_positions():
                 reason = f"Scale-out final: +{pct_gain:.1f}%/share, closing remaining {qty}"
                 if _sell_shares(symbol, qty, current_price, reason, unrealized_pl):
                     engine_state['scale_state'].pop(symbol, None)
+                    log_customer(explain_scale_out_final(symbol, qty, pct_gain))
                     save_state()
 
         # Clean up tracking for anything no longer held at all (fully closed
@@ -799,6 +846,7 @@ def auto_scan():
                 required, out_of = confluence_threshold_for_regime(market_regime)
                 if required is None:
                     log_scan(f"⛔ {symbol} — buy signal ignored: market regime is {market_regime['label']}, new buys paused")
+                    log_customer(explain_regime_blocked(symbol, market_regime['label']))
                     continue
                 agreeing, total, detail = evaluate_confluence(symbol, price, ai, vol_data, sentiment)
                 if total == 0:
@@ -810,9 +858,12 @@ def auto_scan():
                 if agreeing < effective_required:
                     detail_str = ', '.join(f"{name}:{'✓' if ok else '✗'}" for name, ok in detail)
                     log_scan(f"⚫ {symbol} — confluence {agreeing}/{total} (need {effective_required}) [{detail_str}]")
+                    log_customer(explain_confluence_block(symbol, agreeing, total, effective_required, market_regime['label']))
                     continue
                 detail_str = ', '.join(f"{name}:{'✓' if ok else '✗'}" for name, ok in detail)
                 log_scan(f"✅ {symbol} — confluence {agreeing}/{total} agree [{detail_str}]")
+                # Customer-facing entry logged below once we know new-vs-scaling-in,
+                # so it's not duplicated here — see action_label a few lines down.
 
             # Position/exposure check. Counts pending (unfilled) orders, and never
             # opens shorts: this app only buys, and sells only shares it holds.
@@ -857,6 +908,10 @@ def auto_scan():
             entry = f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · AUTO {action_label}: {side.upper()} {qty} {symbol} @ ${price:.2f} · {reason}"
             engine_state['trade_log'].insert(0, entry)
             engine_state['trade_log'] = engine_state['trade_log'][:50]
+            if side == 'buy':
+                log_customer(explain_confluence_pass(symbol, agreeing, total, action_label, market_regime['label']))
+            else:
+                log_customer(explain_sell_signal(symbol, qty))
             save_state()
             log_scan(f"🚀 ORDER PLACED ({action_label}): {side.upper()} {qty} {symbol} @ ${price:.2f}")
             # No per-trade email — see check_and_send_weekly_email().
@@ -1100,6 +1155,7 @@ def engine_status():
         "today_pl": engine_state['today_pl'],
         "scan_log": engine_state['scan_log'][:30],
         "trade_log": engine_state['trade_log'][:20],
+        "customer_feed": engine_state['customer_feed'][:30],
         "is_market_hours": is_market_hours(),
     })
 

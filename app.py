@@ -2,6 +2,13 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from functools import wraps
 import os, requests, json, threading, time, logging, re
+# `requests` lazily imports `netrc` the first time it makes a call. The Auto
+# Engine, Congress Engine, weekly-email and request threads all make their first
+# call at the same moment on boot and have been seen blocked on that import lock
+# (SystemExit tracebacks inside get_netrc_auth). Importing it here, before any
+# thread exists, takes the lock out of play.
+import netrc
+import requests.utils
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import pytz
@@ -1039,7 +1046,11 @@ def auto_scan():
 def engine_loop():
     while engine_state['running']:
         try: auto_scan()
-        except Exception as e: logger.error(f"Engine error: {e}")
+        except Exception as e:
+            logger.error(f"Engine error: {e}")
+            # Also surface it on the dashboard feed — previously a crashing scan
+            # was visible only in the server logs and looked like silence here.
+            log_scan(f"⚠️ Scan crashed: {type(e).__name__}: {str(e)[:120]} — retrying in 5 min")
         time.sleep(300)
 
 def weekly_email_loop():
@@ -1334,6 +1345,7 @@ def congress_loop():
             congress_scan()
         except Exception as e:
             logger.error(f"Congress engine error: {e}")
+            log_congress(f"⚠️ Scan crashed: {type(e).__name__}: {str(e)[:120]}")
         time.sleep(3600)
 
 @app.route("/")

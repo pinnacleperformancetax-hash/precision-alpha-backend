@@ -510,6 +510,131 @@ def record_realized(symbol, qty, entry_price, exit_price, reason, source):
     except Exception as e:
         logger.error(f"record_realized failed for {symbol}: {e}")
 
+# ---- Vault: the at-risk "Trading account" vs. profit set aside ----
+# Bookkeeping inside the app — no money moves at Alpaca. trading balance =
+# starting amount + every banked gain/loss since tracking began - what has been
+# swept to the vault. After each close, that day's banked profit is swept to the
+# vault; a losing day just lowers the trading balance (the vault is never
+# touched). Note the consequence: with the default rule the trading balance can
+# only fall, since gains always move out. 'refill_first' changes that: profit
+# first refills the trading account back up to its starting amount, and only
+# the excess is swept. Optional 'cap_enabled' makes the engine refuse any buy
+# that would push total invested (cost basis) above the trading balance.
+def _vault():
+    v = engine_state.setdefault('vault', {})
+    v.setdefault('trading_start', 20000.0)
+    v.setdefault('cap_enabled', False)
+    v.setdefault('refill_first', False)
+    v.setdefault('swept_total', 0.0)   # cumulative profit swept into the vault
+    v.setdefault('moved_total', 0.0)   # cumulative moved from the vault back to the trading account
+    v.setdefault('taken_out', 0.0)     # cumulative taken out of the vault (spent / withdrawn)
+    v.setdefault('swept', {})
+    v.setdefault('history', [])
+    return v
+
+def vault_balance():
+    """What the vault holds now. Derived from the three running totals so the
+    pieces can never drift apart."""
+    v = _vault()
+    return round(v['swept_total'] - v['moved_total'] - v['taken_out'], 2)
+
+def vault_trading_balance():
+    """Start + all banked gains/losses - profit swept out + money moved back in.
+    Taking money OUT of the vault deliberately doesn't change this."""
+    v, led = _vault(), _ledger()
+    return round(v['trading_start'] + led['total'] - v['swept_total'] + v['moved_total'], 2)
+
+def _vault_history(kind, amount, note=''):
+    est = datetime.now(pytz.timezone('America/New_York'))
+    v = _vault()
+    v['history'].insert(0, {'date': est.strftime('%Y-%m-%d'), 'time': est.strftime('%I:%M %p'),
+                            'type': kind, 'amount': round(amount, 2), 'note': str(note)[:60]})
+    v['history'] = v['history'][:100]
+
+def vault_move(action, amount, note=''):
+    """Move money out of the vault. action 'take_out' = it leaves (you spent or
+    withdrew it); 'to_trading' = it becomes at-risk trading money again.
+    Bookkeeping only. Raises ValueError with a user-readable message."""
+    if action not in ('take_out', 'to_trading'):
+        raise ValueError("action must be 'take_out' or 'to_trading'")
+    try:
+        amount = round(float(amount), 2)
+    except (TypeError, ValueError):
+        raise ValueError("amount must be a number")
+    if amount <= 0:
+        raise ValueError("amount must be greater than zero")
+    sweep_vault_if_due()  # so a just-closed day's profit is available
+    available = vault_balance()
+    if amount > available + 0.001:
+        raise ValueError(f"the vault only holds ${available:,.2f}")
+    v = _vault()
+    key = 'taken_out' if action == 'take_out' else 'moved_total'
+    v[key] = round(v[key] + amount, 2)
+    _vault_history(action, amount, note)
+    save_state()
+    return {"action": action, "amount": amount, "vault_balance": vault_balance(),
+            "trading_balance": vault_trading_balance()}
+
+def sweep_vault_if_due():
+    """Idempotent: sweeps each completed trading day once. Today counts as
+    complete after 4:05 PM ET."""
+    try:
+        v, led = _vault(), _ledger()
+        est = datetime.now(pytz.timezone('America/New_York'))
+        today = est.strftime('%Y-%m-%d')
+        after_close = est.hour > 16 or (est.hour == 16 and est.minute >= 5)
+        for day in list(led['by_day'].keys()):
+            if day in v['swept'] or day > today or (day == today and not after_close):
+                continue
+            day_pnl = led['by_day'][day]
+            amount = 0.0
+            if day_pnl > 0:
+                amount = day_pnl
+                if v['refill_first']:
+                    later = sum(p for d, p in led['by_day'].items() if d > day)
+                    balance_end_of_day = v['trading_start'] + (led['total'] - later) - v['swept_total'] + v['moved_total']
+                    amount = min(day_pnl, max(0.0, balance_end_of_day - v['trading_start']))
+                amount = round(amount, 2)
+            v['swept_total'] = round(v['swept_total'] + amount, 2)
+            v['swept'][day] = amount
+            if amount > 0:
+                _vault_history('sweep', amount, day)
+            while len(v['swept']) > 60:
+                v['swept'].pop(next(iter(v['swept'])))
+            if amount > 0:
+                log_scan(f"🏦 Vault sweep for {day}: ${amount:,.2f} moved from the trading account to the vault")
+                log_customer(f"🏦 Set aside ${amount:,.2f} of {day}'s profit in your vault. It is no longer at risk.")
+            save_state()
+    except Exception as e:
+        logger.error(f"vault sweep failed: {e}")
+
+def get_invested_cost():
+    """Total cost basis of open long positions, or None if it can't be read."""
+    try:
+        r = requests.get(f"{ALPACA_BASE_URL}/positions", headers=alpaca_hdrs(), timeout=10)
+        if not r.ok:
+            return None
+        return round(sum(float(p.get('cost_basis', 0)) for p in r.json() if float(p.get('qty', 0)) > 0), 2)
+    except Exception as e:
+        logger.error(f"invested cost lookup failed: {e}")
+        return None
+
+def capital_cap_blocks(price):
+    """Reason string if a buy of one share at `price` must be refused because
+    it would take total invested above the trading balance; None if allowed.
+    Does nothing unless the cap has been switched on. Fails CLOSED: if the
+    invested amount can't be read, the buy is skipped."""
+    v = _vault()
+    if not v['cap_enabled']:
+        return None
+    balance = vault_trading_balance()
+    invested = get_invested_cost()
+    if invested is None:
+        return "couldn't verify how much is invested"
+    if invested + float(price) > balance:
+        return f"${invested:,.0f} invested + ${float(price):,.2f} would exceed the ${balance:,.0f} trading balance"
+    return None
+
 def _sell_shares(symbol, qty, current_price, reason, unrealized_pl_for_log, avg_entry=None):
     """Places the actual sell order and records it. Shared by the stop-loss,
     tiered scale-out, and final full-exit paths below so the order-placement
@@ -964,6 +1089,7 @@ def evaluate_confluence(symbol, price, ai_result, vol_data, sentiment):
 
 def auto_scan():
     reset_if_needed()
+    sweep_vault_if_due()
     if not is_market_hours():
         log_scan("⏰ Outside trading hours — scan skipped"); return
 
@@ -1073,6 +1199,12 @@ def auto_scan():
             action_label = 'SCALING IN' if is_scale_in else ('NEW POSITION' if side == 'buy' else 'SELL')
             log_scan(f"✅ {symbol} — {side.upper()} signal ({action_label}). Placing... (holding {current_qty}/{r['maxSharesPerStock']}){level_tag(symbol)}")
 
+            if side == 'buy':
+                blocked = capital_cap_blocks(price)
+                if blocked:
+                    log_scan(f"⛔ {symbol} — trading-account cap: {blocked}")
+                    log_customer(f"⛔ {symbol} — Skipped. Buying more would put more money at risk than your trading account holds.")
+                    continue
             sell_entry = get_avg_entry(symbol) if side == 'sell' else None  # must read BEFORE the sell closes the position
             or_ = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(),
                 json={"symbol": symbol, "qty": str(qty), "side": side, "type": "market", "time_in_force": "day"}, timeout=10)
@@ -1359,6 +1491,10 @@ def congress_scan():
                 continue
 
             log_congress(f"📋 Copying congressional BUY: {ticker} @ ${price:.2f} (holding {current_qty}/{cap})")
+            blocked = capital_cap_blocks(price)
+            if blocked:
+                log_congress(f"⛔ {ticker} — trading-account cap: {blocked}")
+                continue
 
             or_ = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(),
                 json={"symbol": ticker, "qty": str(qty), "side": "buy", "type": "market", "time_in_force": "day"}, timeout=10)
@@ -1911,16 +2047,18 @@ def ai_analyze():
 @app.route("/api/profit/ledger")
 def profit_ledger():
     """Banked (realized) profit kept separate from money still at risk."""
+    sweep_vault_if_due()
     led = _ledger()
     est = datetime.now(pytz.timezone('America/New_York'))
     day, wk = est.strftime('%Y-%m-%d'), get_week_key()
-    unrealized = open_positions = None
+    unrealized = open_positions = invested = None
     try:
         pr = requests.get(f"{ALPACA_BASE_URL}/positions", headers=alpaca_hdrs(), timeout=10)
         if pr.ok:
             plist = pr.json()
             open_positions = len(plist)
             unrealized = round(sum(float(p.get('unrealized_pl', 0)) for p in plist), 2)
+            invested = round(sum(float(p.get('cost_basis', 0)) for p in plist if float(p.get('qty', 0)) > 0), 2)
     except Exception as e:
         logger.error(f"ledger positions lookup failed: {e}")
     by_symbol = {}
@@ -1934,9 +2072,55 @@ def profit_ledger():
         "unrealized_open": unrealized,
         "open_positions": open_positions,
         "account_change_today": round(get_real_today_pl(), 2),
+        "vault": {
+            "trading_start": _vault()['trading_start'],
+            "trading_balance": vault_trading_balance(),
+            "vault_balance": vault_balance(),
+            "taken_out": _vault()['taken_out'],
+            "history": _vault()['history'][:8],
+            "invested": invested,
+            "room_left": None if invested is None else round(vault_trading_balance() - invested, 2),
+            "cap_enabled": _vault()['cap_enabled'],
+            "refill_first": _vault()['refill_first'],
+        },
         "by_symbol": dict(sorted(by_symbol.items(), key=lambda kv: kv[1], reverse=True)),
         "recent": led['entries'][:25],
     })
+
+@app.route("/api/vault/withdraw", methods=["POST"])
+@require_api_key
+def vault_withdraw():
+    data = request.get_json() or {}
+    try:
+        result = vault_move(data.get('action'), data.get('amount'), data.get('note', ''))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    label = "taken out of the vault" if result['action'] == 'take_out' else "moved from the vault to the trading account"
+    log_scan(f"🏦 ${result['amount']:,.2f} {label} (vault now ${result['vault_balance']:,.2f}, trading ${result['trading_balance']:,.2f})")
+    log_customer(f"🏦 ${result['amount']:,.2f} {label}.")
+    return jsonify(result)
+
+@app.route("/api/vault/set", methods=["POST"])
+@require_api_key
+def set_vault():
+    data = request.get_json() or {}
+    v = _vault()
+    if 'trading_start' in data:
+        try:
+            amt = float(data['trading_start'])
+        except (TypeError, ValueError):
+            return jsonify({"error": "trading_start must be a number"}), 400
+        if not (1000 <= amt <= 10_000_000):
+            return jsonify({"error": "trading_start must be between 1,000 and 10,000,000"}), 400
+        v['trading_start'] = round(amt, 2)
+    for key in ('cap_enabled', 'refill_first'):
+        if key in data:
+            v[key] = bool(data[key])
+    save_state()
+    log_scan(f"🏦 Vault settings: trading account ${v['trading_start']:,.0f}, "
+             f"cap {'ON' if v['cap_enabled'] else 'off'}, refill-first {'ON' if v['refill_first'] else 'off'}")
+    return jsonify({"trading_start": v['trading_start'], "cap_enabled": v['cap_enabled'],
+                    "refill_first": v['refill_first'], "trading_balance": vault_trading_balance()})
 
 @app.route("/api/risk/get")
 def get_risk_level():

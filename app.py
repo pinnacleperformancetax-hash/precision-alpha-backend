@@ -460,7 +460,57 @@ def check_and_send_weekly_email():
     save_state()
     log_scan("✉️ Weekly summary email sent")
 
-def _sell_shares(symbol, qty, current_price, reason, unrealized_pl_for_log):
+# ---- Profit ledger: banked (realized) profit, tracked apart from money at risk ----
+# Records the gain/loss each time the engine SELLS, from the position's average
+# entry price and the price at the moment of the sell. Figures are ESTIMATES:
+# market orders can fill a few cents away from that price. Not tracked: manual
+# sells from the Trade page. Lives in engine_state, so like everything else in
+# it, it is wiped by a fresh deploy ('since' shows when tracking began).
+def _ledger():
+    led = engine_state.setdefault('profit_ledger', {})
+    led.setdefault('entries', [])
+    led.setdefault('total', 0.0)
+    led.setdefault('by_day', {})
+    led.setdefault('by_week', {})
+    led.setdefault('since', datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d'))
+    return led
+
+def get_avg_entry(symbol):
+    try:
+        r = requests.get(f"{ALPACA_BASE_URL}/positions/{symbol}", headers=alpaca_hdrs(), timeout=10)
+        if r.ok:
+            v = float(r.json().get('avg_entry_price', 0))
+            return v if v > 0 else None
+    except Exception as e:
+        logger.error(f"avg entry lookup failed for {symbol}: {e}")
+    return None
+
+def record_realized(symbol, qty, entry_price, exit_price, reason, source):
+    try:
+        entry_price, exit_price, qty = float(entry_price), float(exit_price), int(qty)
+        if entry_price <= 0 or exit_price <= 0 or qty <= 0:
+            return
+        pnl = round((exit_price - entry_price) * qty, 2)
+        est = datetime.now(pytz.timezone('America/New_York'))
+        day, wk = est.strftime('%Y-%m-%d'), get_week_key()
+        led = _ledger()
+        led['total'] = round(led['total'] + pnl, 2)
+        led['by_day'][day] = round(led['by_day'].get(day, 0.0) + pnl, 2)
+        led['by_week'][wk] = round(led['by_week'].get(wk, 0.0) + pnl, 2)
+        while len(led['by_day']) > 30:
+            led['by_day'].pop(next(iter(led['by_day'])))
+        while len(led['by_week']) > 12:
+            led['by_week'].pop(next(iter(led['by_week'])))
+        led['entries'].insert(0, {
+            'date': day, 'time': est.strftime('%I:%M %p'), 'symbol': symbol, 'qty': qty,
+            'entry': round(entry_price, 2), 'exit': round(exit_price, 2), 'pnl': pnl,
+            'reason': str(reason)[:60], 'source': source,
+        })
+        led['entries'] = led['entries'][:300]
+    except Exception as e:
+        logger.error(f"record_realized failed for {symbol}: {e}")
+
+def _sell_shares(symbol, qty, current_price, reason, unrealized_pl_for_log, avg_entry=None):
     """Places the actual sell order and records it. Shared by the stop-loss,
     tiered scale-out, and final full-exit paths below so the order-placement
     and logging logic isn't duplicated three times."""
@@ -473,6 +523,8 @@ def _sell_shares(symbol, qty, current_price, reason, unrealized_pl_for_log):
         engine_state['trade_log'].insert(0, entry)
         engine_state['trade_log'] = engine_state['trade_log'][:50]
         engine_state['today_pl'] += unrealized_pl_for_log
+        if avg_entry:
+            record_realized(symbol, qty, avg_entry, current_price, reason, 'engine')
         save_state()
         return True
     else:
@@ -518,7 +570,7 @@ def check_and_sell_positions():
             # --- Stop loss: unchanged, full immediate exit, clears scale tracking ---
             if avg_entry > 0 and pct_gain <= -r['maxLossPct']:
                 reason = f"Stop loss: {pct_gain:.1f}% (limit -{r['maxLossPct']}%, ${per_share_pl:.2f}/share){level_tag(symbol)}"
-                if _sell_shares(symbol, qty, current_price, reason, unrealized_pl):
+                if _sell_shares(symbol, qty, current_price, reason, unrealized_pl, avg_entry=avg_entry):
                     engine_state['scale_state'].pop(symbol, None)
                     log_customer(explain_stop_loss(symbol, qty, pct_gain))
                     save_state()
@@ -541,7 +593,7 @@ def check_and_sell_positions():
                     continue
                 sell_qty = min(qty, max(1, round(st['origin_qty'] * tier_frac)))
                 reason = f"Scale-out tier {i+1}: +{pct_gain:.1f}% (selling {int(tier_frac*100)}% of original {st['origin_qty']})"
-                if _sell_shares(symbol, sell_qty, current_price, reason, unrealized_pl * (sell_qty / qty)):
+                if _sell_shares(symbol, sell_qty, current_price, reason, unrealized_pl * (sell_qty / qty), avg_entry=avg_entry):
                     st['tiers_hit'][i] = True
                     log_customer(explain_scale_out_tier(symbol, sell_qty, pct_gain, i + 1))
                     save_state()
@@ -553,7 +605,7 @@ def check_and_sell_positions():
             # runs on next cycle's fresh position data, seeing the reduced qty.
             if pct_gain >= r['scaleOutTier3Pct']:
                 reason = f"Scale-out final: +{pct_gain:.1f}%/share, closing remaining {qty}"
-                if _sell_shares(symbol, qty, current_price, reason, unrealized_pl):
+                if _sell_shares(symbol, qty, current_price, reason, unrealized_pl, avg_entry=avg_entry):
                     engine_state['scale_state'].pop(symbol, None)
                     log_customer(explain_scale_out_final(symbol, qty, pct_gain))
                     save_state()
@@ -1021,10 +1073,13 @@ def auto_scan():
             action_label = 'SCALING IN' if is_scale_in else ('NEW POSITION' if side == 'buy' else 'SELL')
             log_scan(f"✅ {symbol} — {side.upper()} signal ({action_label}). Placing... (holding {current_qty}/{r['maxSharesPerStock']}){level_tag(symbol)}")
 
+            sell_entry = get_avg_entry(symbol) if side == 'sell' else None  # must read BEFORE the sell closes the position
             or_ = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(),
                 json={"symbol": symbol, "qty": str(qty), "side": side, "type": "market", "time_in_force": "day"}, timeout=10)
             if not or_.ok:
                 log_scan(f"❌ {symbol} — order failed"); continue
+            if side == 'sell' and sell_entry:
+                record_realized(symbol, qty, sell_entry, price, "AI sell signal", 'ai')
 
             engine_state['weekly_trades'].append({'symbol': symbol, 'side': side, 'qty': qty, 'price': price, 'source': 'auto'})
             entry = f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · AUTO {action_label}: {side.upper()} {qty} {symbol} @ ${price:.2f} · {reason}"
@@ -1852,6 +1907,36 @@ def ai_analyze():
     except Exception as e: return jsonify({"error": str(e)}), 500
 
 
+
+@app.route("/api/profit/ledger")
+def profit_ledger():
+    """Banked (realized) profit kept separate from money still at risk."""
+    led = _ledger()
+    est = datetime.now(pytz.timezone('America/New_York'))
+    day, wk = est.strftime('%Y-%m-%d'), get_week_key()
+    unrealized = open_positions = None
+    try:
+        pr = requests.get(f"{ALPACA_BASE_URL}/positions", headers=alpaca_hdrs(), timeout=10)
+        if pr.ok:
+            plist = pr.json()
+            open_positions = len(plist)
+            unrealized = round(sum(float(p.get('unrealized_pl', 0)) for p in plist), 2)
+    except Exception as e:
+        logger.error(f"ledger positions lookup failed: {e}")
+    by_symbol = {}
+    for e in led['entries']:
+        by_symbol[e['symbol']] = round(by_symbol.get(e['symbol'], 0.0) + e['pnl'], 2)
+    return jsonify({
+        "realized_today": led['by_day'].get(day, 0.0),
+        "realized_week": led['by_week'].get(wk, 0.0),
+        "realized_total": led['total'],
+        "tracking_since": led['since'],
+        "unrealized_open": unrealized,
+        "open_positions": open_positions,
+        "account_change_today": round(get_real_today_pl(), 2),
+        "by_symbol": dict(sorted(by_symbol.items(), key=lambda kv: kv[1], reverse=True)),
+        "recent": led['entries'][:25],
+    })
 
 @app.route("/api/risk/get")
 def get_risk_level():

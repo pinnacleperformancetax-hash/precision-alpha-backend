@@ -314,6 +314,17 @@ def get_real_today_pl():
     except:
         return engine_state['today_pl']
 
+_pl_cache = {'ts': 0.0, 'val': 0.0}
+def cached_real_today_pl():
+    """get_real_today_pl() with a 15s cache, so status polling doesn't add an
+    Alpaca call per request."""
+    now = time.time()
+    if now - _pl_cache['ts'] < 15:
+        return _pl_cache['val']
+    val = get_real_today_pl()
+    _pl_cache['ts'], _pl_cache['val'] = now, val
+    return val
+
 def alpaca_hdrs():
     return {'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET, 'Content-Type': 'application/json'}
 
@@ -1386,15 +1397,14 @@ def get_congress_trades():
                          'newest': r['newest'], 'ms': r['ms'], 'error': r['error']} for r in results],
         }
         if not winner:
-            log_congress("All sources failed — using fallback stock list")
-            # Fallback: use popular stocks that congress frequently buys
-            return [
-                {'ticker': 'NVDA', 'action': 'buy'},
-                {'ticker': 'MSFT', 'action': 'buy'},
-                {'ticker': 'AAPL', 'action': 'buy'},
-                {'ticker': 'AMZN', 'action': 'buy'},
-                {'ticker': 'GOOGL', 'action': 'buy'},
-            ]
+            # Previously this returned a hardcoded list (NVDA/MSFT/AAPL/AMZN/GOOGL) and
+            # the engine bought from it as if those were congressional trades. They
+            # weren't — and those names are also ones the Auto Engine trades, so the two
+            # engines kept buying and selling the same stocks against each other.
+            # With no data there is no signal, so buy nothing. congress_scan doesn't
+            # mark the day as scanned in this case, so it retries on its next hourly pass.
+            log_congress("⛔ All data sources failed — buying nothing today (no hardcoded fallback). Will retry next hour.")
+            return []
         log_congress(f"🏁 Using {winner['name']} (freshest data: {winner['newest'] or 'undated'})")
         trades, seen = [], set()
         for row in winner['rows']:
@@ -1575,7 +1585,11 @@ def engine_status():
     return jsonify({
         "running": engine_state['running'],
         "weekly_trades": len(engine_state['weekly_trades']),
-        "today_pl": engine_state['today_pl'],
+        # Real account figure (equity - last close equity), the same one the daily
+        # loss limit uses. This used to be engine_state['today_pl'], a counter that
+        # resets on every deploy and gets adjusted by individual sells, so the
+        # dashboard card disagreed with the top bar.
+        "today_pl": round(cached_real_today_pl(), 2),
         "scan_log": engine_state['scan_log'][:30],
         "trade_log": engine_state['trade_log'][:20],
         "customer_feed": engine_state['customer_feed'][:30],

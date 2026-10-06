@@ -3,6 +3,7 @@ from flask_cors import CORS
 from functools import wraps
 import os, requests, json, threading, time, logging, re
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 import pytz
 
 app = Flask(__name__)
@@ -53,13 +54,16 @@ MARKET_SCAN_LIST = ['AAPL','TSLA','NVDA','SPY','QQQ','MSFT','AMD','META','GOOGL'
 
 RULES = {
     'maxDailyLoss': 30, 'maxTrades': 999, 'maxPositionSize': 200,
-    'maxLossPerTrade': 9, 'takeProfitTarget': 30,
+    # Stop-loss as a % below the average entry price, not flat dollars: a $9
+    # stop was ~3% on a $300 stock but ~60% on a $15 one, so it protected
+    # expensive stocks and barely existed for cheap ones.
+    'maxLossPct': 4, 'takeProfitTarget': 30,
     'minConfidence': 30, 'maxVolatility': 90, 'minSyncScore': 30, 'maxSharesPerStock': 5, 'takeProfitPct': 15,
     # Scale-out: tiered profit-taking instead of an all-or-nothing exit at
     # takeProfitPct. Tier 1 and 2 sell a FRACTION of the position's original
     # size (not current size — see engine_state['scale_state']) once each
     # gain threshold is crossed; tier 3 always sells whatever remains. A
-    # stop-loss hit (maxLossPerTrade) still exits the FULL position
+    # stop-loss hit (maxLossPct) still exits the FULL position
     # immediately regardless of tiers — partial exits are for locking in
     # gains, not for softening a loss.
     'scaleOutTier1Pct': 5,  'scaleOutTier1Frac': 0.34,
@@ -71,6 +75,12 @@ engine_state = {
     'running': False, 'weekly_trades': [], 'today_pl': 0.0,
     'last_date': '', 'week_key': '', 'scan_log': [], 'trade_log': [],
     'last_weekly_email_week': '',
+    # Active risk level — one of RISK_PROFILES' keys. Persisted so a restart
+    # keeps it; RULES itself is rebuilt from this at boot (see below load_state()).
+    'risk_level': 'balanced',
+    # Per-stock overrides: {'AAPL': 'aggressive'}. A stock not listed here uses
+    # the account-wide risk_level above.
+    'symbol_risk': {},
     # Plain-language version of the scan_log, for customers rather than
     # debugging. scan_log stays exactly as-is (engineer-readable, e.g.
     # "confluence 3/4 agree [trend:✓, momentum:✗...]") since that detail has
@@ -121,6 +131,98 @@ def save_state():
     except Exception as e:
         logger.error(f"Failed to save state: {e}")
 
+# ---- Risk levels ----
+# Each level overwrites a bundle of RULES together so they stay coherent
+# (a tight stop with loose profit targets, or the reverse, is a classic
+# way to lose money by accident). 'balanced' is EXACTLY the values the app
+# has been running on (except the stop, now a 4% stop instead of a flat
+# $9/share — see RULES), so choosing it changes almost nothing.
+#
+# 'confluence_offset' shifts how many signals must agree: -1 requires one
+# fewer (more trades), +1 requires one more (fewer, higher-conviction
+# trades). The result never drops below 2 signals in any level.
+#
+# These numbers are starting points, not backtested constants — same
+# caveat as the confluence thresholds and scale-out tiers. Hard rails that
+# NO level can turn off: the bear-market block on new buys, the daily loss
+# limit (it scales, but always exists), no shorting, and the position cap.
+RISK_PROFILES = {
+    'conservative': {
+        'label': 'Conservative',
+        'description': 'Smaller positions, tighter stops, takes profit earlier, and needs more signals to agree before buying.',
+        'rules': {
+            'maxDailyLoss': 20, 'maxSharesPerStock': 3, 'maxLossPct': 2.5,
+            'minConfidence': 50, 'maxVolatility': 70, 'minSyncScore': 50,
+            'scaleOutTier1Pct': 3, 'scaleOutTier2Pct': 6, 'scaleOutTier3Pct': 9,
+            'takeProfitPct': 9,
+        },
+        'confluence_offset': 1,
+    },
+    'balanced': {
+        'label': 'Balanced',
+        'description': 'The default. Moderate position sizes, stops, and profit targets.',
+        'rules': {
+            'maxDailyLoss': 30, 'maxSharesPerStock': 5, 'maxLossPct': 4,
+            'minConfidence': 30, 'maxVolatility': 90, 'minSyncScore': 30,
+            'scaleOutTier1Pct': 5, 'scaleOutTier2Pct': 10, 'scaleOutTier3Pct': 15,
+            'takeProfitPct': 15,
+        },
+        'confluence_offset': 0,
+    },
+    'aggressive': {
+        'label': 'Aggressive',
+        'description': 'Larger positions, wider stops, lets winners run further, and acts on fewer confirming signals. More trades, bigger swings both ways.',
+        'rules': {
+            'maxDailyLoss': 60, 'maxSharesPerStock': 8, 'maxLossPct': 7,
+            'minConfidence': 25, 'maxVolatility': 95, 'minSyncScore': 25,
+            'scaleOutTier1Pct': 8, 'scaleOutTier2Pct': 16, 'scaleOutTier3Pct': 25,
+            'takeProfitPct': 25,
+        },
+        'confluence_offset': -1,
+    },
+}
+
+def apply_risk_profile(level):
+    """Overwrite RULES with the chosen level's bundle. Returns True if the
+    level exists. Deliberately does not log (it runs at import time, before
+    log_scan exists) — callers that want a log line add their own."""
+    prof = RISK_PROFILES.get(level)
+    if not prof:
+        return False
+    RULES.update(prof['rules'])
+    engine_state['risk_level'] = level
+    return True
+
+def level_for(symbol):
+    """Risk level in effect for one stock: its own override if it has one,
+    otherwise the account-wide level."""
+    override = engine_state.get('symbol_risk', {}).get(str(symbol).upper())
+    return override if override in RISK_PROFILES else engine_state.get('risk_level', 'balanced')
+
+def has_override(symbol):
+    return str(symbol).upper() in engine_state.get('symbol_risk', {})
+
+def rules_for(symbol):
+    """RULES as they apply to this one stock. Per-stock settings come from the
+    stock's override level if it has one. maxDailyLoss is deliberately NOT
+    overridden per stock — it's measured across the whole account — and
+    neither are maxTrades / maxPositionSize, which aren't part of any level."""
+    r = dict(RULES)
+    if has_override(symbol):
+        prof = RISK_PROFILES.get(level_for(symbol))
+        if prof:
+            r.update({k: v for k, v in prof['rules'].items() if k != 'maxDailyLoss'})
+    return r
+
+def confluence_offset_for(symbol=None):
+    prof = RISK_PROFILES.get(level_for(symbol) if symbol else engine_state.get('risk_level', 'balanced'))
+    return prof['confluence_offset'] if prof else 0
+
+def level_tag(symbol):
+    """' [Aggressive]' for a stock with its own override, else '' — appended to
+    log lines so it's obvious why one stock is being treated differently."""
+    return f" [{RISK_PROFILES[level_for(symbol)]['label']}]" if has_override(symbol) else ""
+
 def load_state():
     try:
         if not os.path.exists(STATE_FILE):
@@ -135,6 +237,10 @@ def load_state():
         logger.error(f"Failed to load state, starting fresh: {e}")
 
 load_state()
+# RULES isn't persisted (it resets on every deploy), but the chosen level is —
+# rebuild RULES from it so a restart or redeploy keeps the user's setting.
+if not apply_risk_profile(engine_state.get('risk_level', 'balanced')):
+    apply_risk_profile('balanced')
 
 _engine_started = False
 _congress_started = False
@@ -396,14 +502,15 @@ def check_and_sell_positions():
                 continue
             held_symbols.add(symbol)
 
+            r = rules_for(symbol)  # this stock's rules (its own level if it has an override)
             avg_entry = float(pos.get('avg_entry_price', 0))
             per_share_pl = current_price - avg_entry if avg_entry > 0 else 0
             pct_gain = ((current_price - avg_entry) / avg_entry * 100) if avg_entry > 0 else 0
             unrealized_pl = float(pos.get('unrealized_pl', 0))
 
             # --- Stop loss: unchanged, full immediate exit, clears scale tracking ---
-            if per_share_pl <= -RULES['maxLossPerTrade']:
-                reason = f"Stop loss: ${per_share_pl:.2f}/share ({pct_gain:.1f}%)"
+            if avg_entry > 0 and pct_gain <= -r['maxLossPct']:
+                reason = f"Stop loss: {pct_gain:.1f}% (limit -{r['maxLossPct']}%, ${per_share_pl:.2f}/share){level_tag(symbol)}"
                 if _sell_shares(symbol, qty, current_price, reason, unrealized_pl):
                     engine_state['scale_state'].pop(symbol, None)
                     log_customer(explain_stop_loss(symbol, qty, pct_gain))
@@ -419,8 +526,8 @@ def check_and_sell_positions():
                 st['tiers_hit'] = [False, False]
 
             tier_defs = [
-                (RULES['scaleOutTier1Pct'], RULES['scaleOutTier1Frac']),
-                (RULES['scaleOutTier2Pct'], RULES['scaleOutTier2Frac']),
+                (r['scaleOutTier1Pct'], r['scaleOutTier1Frac']),
+                (r['scaleOutTier2Pct'], r['scaleOutTier2Frac']),
             ]
             for i, (tier_pct, tier_frac) in enumerate(tier_defs):
                 if st['tiers_hit'][i] or pct_gain < tier_pct:
@@ -437,7 +544,7 @@ def check_and_sell_positions():
             # Re-fetch qty is not needed here since a same-cycle partial sell
             # above already `break`s before reaching this — final-tier check
             # runs on next cycle's fresh position data, seeing the reduced qty.
-            if pct_gain >= RULES['scaleOutTier3Pct']:
+            if pct_gain >= r['scaleOutTier3Pct']:
                 reason = f"Scale-out final: +{pct_gain:.1f}%/share, closing remaining {qty}"
                 if _sell_shares(symbol, qty, current_price, reason, unrealized_pl):
                     engine_state['scale_state'].pop(symbol, None)
@@ -740,19 +847,25 @@ def get_market_regime():
     _regime_cache['regime'] = regime
     return regime
 
-def confluence_threshold_for_regime(regime):
+def confluence_threshold_for_regime(regime, symbol=None):
     """How many of the (up to 5) confluence signals must agree, and out of
     how many, given the current regime. Returns (required, out_of) or
     (None, None) if new buys are blocked entirely this regime.
     These specific thresholds are a starting point, not backtested constants
     — tune them once you've watched this run against real market days."""
     if regime['trend'] == 'bear':
-        return None, None  # no new buys while SPY is below its own 20-day trend
+        return None, None  # no new buys while SPY is below its own 20-day trend — applies at EVERY risk level
     if regime['trend'] == 'bull' and regime['volatility'] == 'low':
-        return 3, 5
-    if regime['trend'] == 'bull':  # normal or high vol
-        return 4, 5
-    return 4, 5  # unknown/neutral — be conservative
+        required, out_of = 3, 5
+    elif regime['trend'] == 'bull':  # normal or high vol
+        required, out_of = 4, 5
+    else:
+        required, out_of = 4, 5  # unknown/neutral — be conservative
+    # Risk level shifts the bar by +/-1 signal, but never below 2 (one lone
+    # signal agreeing is not confluence) and never above the number of
+    # signals that exist.
+    required = max(2, min(out_of, required + confluence_offset_for(symbol)))
+    return required, out_of
 
 def evaluate_confluence(symbol, price, ai_result, vol_data, sentiment):
     """Scores up to 5 independent signals for one stock. Returns
@@ -778,11 +891,12 @@ def evaluate_confluence(symbol, price, ai_result, vol_data, sentiment):
         signals.append(('sentiment', sentiment['score'] >= 20))
 
     if ai_result:
+        r = rules_for(symbol)
         ai_bullish = (
             ai_result.get('side') == 'buy'
-            and ai_result.get('confidence', 0) >= RULES['minConfidence']
-            and ai_result.get('volatility', 100) <= RULES['maxVolatility']
-            and ai_result.get('sync', 0) >= RULES['minSyncScore']
+            and ai_result.get('confidence', 0) >= r['minConfidence']
+            and ai_result.get('volatility', 100) <= r['maxVolatility']
+            and ai_result.get('sync', 0) >= r['minSyncScore']
         )
         signals.append(('ai', ai_bullish))
 
@@ -834,7 +948,8 @@ def auto_scan():
             conf, vol, sync = ai.get('confidence',0), ai.get('volatility',100), ai.get('sync',0)
             side, reason = ai.get('side','buy'), ai.get('reason','')
 
-            if conf < RULES['minConfidence'] or vol > RULES['maxVolatility'] or sync < RULES['minSyncScore']:
+            r = rules_for(symbol)
+            if conf < r['minConfidence'] or vol > r['maxVolatility'] or sync < r['minSyncScore']:
                 log_scan(f"⚫ {symbol} — blocked (C:{conf} V:{vol} S:{sync})"); continue
 
             # Confluence gate: only applies to NEW BUYS. A sell signal is
@@ -843,7 +958,7 @@ def auto_scan():
             # to clear the basic AI-quality check above, plus the "did we
             # actually hold shares" check below.
             if side == 'buy':
-                required, out_of = confluence_threshold_for_regime(market_regime)
+                required, out_of = confluence_threshold_for_regime(market_regime, symbol)
                 if required is None:
                     log_scan(f"⛔ {symbol} — buy signal ignored: market regime is {market_regime['label']}, new buys paused")
                     log_customer(explain_regime_blocked(symbol, market_regime['label']))
@@ -883,8 +998,8 @@ def auto_scan():
                 if held < 0:
                     log_scan(f"⏭ {symbol} — short position open ({held}), skipping buys until it's covered")
                     continue
-                if current_qty >= RULES['maxSharesPerStock']:
-                    log_scan(f"⏭ {symbol} — max {RULES['maxSharesPerStock']} shares held/pending, skipping")
+                if current_qty >= r['maxSharesPerStock']:
+                    log_scan(f"⏭ {symbol} — max {r['maxSharesPerStock']} shares held/pending, skipping{level_tag(symbol)}")
                     continue
 
             qty = 1  # Always buy 1 share at a time
@@ -897,7 +1012,7 @@ def auto_scan():
             # "max adds per day" counter, since that cap already bounds it.
             is_scale_in = side == 'buy' and current_qty > 0
             action_label = 'SCALING IN' if is_scale_in else ('NEW POSITION' if side == 'buy' else 'SELL')
-            log_scan(f"✅ {symbol} — {side.upper()} signal ({action_label}). Placing... (holding {current_qty}/{RULES['maxSharesPerStock']})")
+            log_scan(f"✅ {symbol} — {side.upper()} signal ({action_label}). Placing... (holding {current_qty}/{r['maxSharesPerStock']}){level_tag(symbol)}")
 
             or_ = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(),
                 json={"symbol": symbol, "qty": str(qty), "side": side, "type": "market", "time_in_force": "day"}, timeout=10)
@@ -938,29 +1053,130 @@ def weekly_email_loop():
         except Exception as e: logger.error(f"Weekly email check error: {e}")
         time.sleep(1800)
 
-def get_congress_trades():
-    """Fetch recent congressional trades from House Stock Watcher GitHub API"""
+# ---- Congress data: poll every source in parallel, use the best one ----
+# Sources race side by side (total wait = the slowest one, capped), but the
+# winner is picked on DATA QUALITY, not speed: the scan runs once a day, so a
+# fresher, fuller dataset matters far more than a faster response. Every
+# source's result is logged and kept in congress_state['last_race'] so you can
+# see which ones are alive and how they compare.
+CONGRESS_SOURCES = [
+    {'name': 'House Stock Watcher (S3)', 'kind': 'legacy',
+     'url': "https://house-stock-watcher-data.s3-us-east-2.amazonaws.com/data/all_transactions.json"},
+    {'name': 'GitHub trades.json', 'kind': 'legacy',
+     'url': "https://raw.githubusercontent.com/ratemycongress/congressional-stock-trades/main/data/trades.json"},
+    # House + Senate STOCK Act filings, newest transaction first, last 3 months.
+    # Keyless use is capped (30 requests/day per IP — Render IPs are shared, so
+    # set BARGO_API_KEY on Render for a reliable limit). Terms require a visible
+    # credit linking to Bargo wherever the data is DISPLAYED to users.
+    {'name': 'Bargo API (House+Senate)', 'kind': 'bargo',
+     'url': "https://www.bargo.ai/free-apis/congress/v1/trades?limit=100"},
+]
+
+def _parse_date(s):
+    """Best-effort 'YYYY-MM-DD' from ISO or MM/DD/YYYY; '' if unparseable."""
+    if not s:
+        return ''
+    s = str(s).strip()[:10]
+    for fmt in ('%Y-%m-%d', '%m/%d/%Y'):
+        try:
+            return datetime.strptime(s, fmt).strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+    return ''
+
+def _action_from_type(tx):
+    t = str(tx or '').lower()
+    if 'exchange' in t:
+        return None
+    if 'purchase' in t or 'buy' in t:
+        return 'buy'
+    if 'sale' in t or 'sell' in t:
+        return 'sell'
+    return None  # unknown type: skip rather than guess a direction
+
+def _normalize_congress_rows(rows):
+    out = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        ticker = str(item.get('ticker') or '').strip().upper()
+        if not ticker or ticker in ('--', 'N/A') or len(ticker) > 5:
+            continue
+        action = _action_from_type(item.get('type') or item.get('transaction_type'))
+        if not action:
+            continue
+        date = max(_parse_date(item.get('transaction_date')), _parse_date(item.get('disclosure_date')))
+        out.append({'ticker': ticker, 'action': action, 'date': date})
+    # Newest first. If no row has a date this is a no-op (stable sort), which
+    # preserves the old "first 100 as delivered" behaviour for undated files.
+    out.sort(key=lambda r: r['date'], reverse=True)
+    return out[:100]
+
+def _fetch_congress_source(src):
+    started = time.time()
+    result = {'name': src['name'], 'ok': False, 'rows': [], 'newest': '', 'error': '', 'ms': 0}
     try:
-        # Try multiple free sources
-        urls = [
-            "https://house-stock-watcher-data.s3-us-east-2.amazonaws.com/data/all_transactions.json",
-            "https://raw.githubusercontent.com/ratemycongress/congressional-stock-trades/main/data/trades.json",
-        ]
-        
-        data = None
-        for url in urls:
-            try:
-                res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-                if res.ok:
-                    data = res.json()
-                    log_congress(f"Connected to: {url[:50]}...")
-                    break
-                else:
-                    log_congress(f"URL returned {res.status_code}, trying next...")
-            except:
-                continue
-        
-        if not data:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        key = os.environ.get('BARGO_API_KEY')
+        if src['kind'] == 'bargo' and key:
+            headers['X-Api-Key'] = key
+        res = requests.get(src['url'], headers=headers, timeout=15)
+        result['ms'] = int((time.time() - started) * 1000)
+        if not res.ok:
+            result['error'] = f"HTTP {res.status_code}"
+            if res.status_code == 429 and src['kind'] == 'bargo':
+                result['error'] += " (daily limit reached — set BARGO_API_KEY on Render)"
+            elif res.status_code == 401 and src['kind'] == 'bargo':
+                result['error'] += " (BARGO_API_KEY rejected)"
+            return result
+        data = res.json()
+        rows = data.get('trades') if isinstance(data, dict) else data
+        if not isinstance(rows, list):
+            result['error'] = 'unexpected response shape'
+            return result
+        norm = _normalize_congress_rows(rows)
+        result['rows'] = norm
+        result['newest'] = max((r['date'] for r in norm), default='')
+        result['ok'] = bool(norm)
+        if not norm:
+            result['error'] = 'no usable trades in response'
+    except Exception as e:
+        result['ms'] = int((time.time() - started) * 1000)
+        result['error'] = f"{type(e).__name__}: {str(e)[:60]}"
+    return result
+
+def race_congress_sources():
+    ex = ThreadPoolExecutor(max_workers=len(CONGRESS_SOURCES))
+    futures = [(s, ex.submit(_fetch_congress_source, s)) for s in CONGRESS_SOURCES]
+    results = []
+    for s, f in futures:
+        try:
+            results.append(f.result(timeout=25))
+        except Exception as e:
+            results.append({'name': s['name'], 'ok': False, 'rows': [], 'newest': '', 'ms': 25000,
+                            'error': f"timed out ({type(e).__name__})"})
+    ex.shutdown(wait=False)  # don't block on a straggler
+    ok = [r for r in results if r['ok']]
+    # Best = freshest data first, then breadth (distinct tickers).
+    winner = max(ok, key=lambda r: (r['newest'], len({x['ticker'] for x in r['rows']}))) if ok else None
+    return results, winner
+
+def get_congress_trades():
+    """Recent congressional trades from whichever source wins the race."""
+    try:
+        results, winner = race_congress_sources()
+        for r in results:
+            if r['ok']:
+                log_congress(f"📡 {r['name']}: {len(r['rows'])} trades, newest {r['newest'] or 'n/a'}, {r['ms']}ms")
+            else:
+                log_congress(f"❌ {r['name']}: {r['error']} ({r['ms']}ms)")
+        congress_state['last_race'] = {
+            'time': datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d %I:%M %p'),
+            'winner': winner['name'] if winner else None,
+            'sources': [{'name': r['name'], 'ok': r['ok'], 'trades': len(r['rows']),
+                         'newest': r['newest'], 'ms': r['ms'], 'error': r['error']} for r in results],
+        }
+        if not winner:
             log_congress("All sources failed — using fallback stock list")
             # Fallback: use popular stocks that congress frequently buys
             return [
@@ -970,21 +1186,13 @@ def get_congress_trades():
                 {'ticker': 'AMZN', 'action': 'buy'},
                 {'ticker': 'GOOGL', 'action': 'buy'},
             ]
-
-        trades = []
-        seen = set()
-        recent = data[:100] if isinstance(data, list) else []
-        for item in recent:
-            ticker = item.get('ticker', '').strip().upper()
-            tx_type = str(item.get('type', '') or item.get('transaction_type', '')).lower()
-            if not ticker or ticker in ('--', 'N/A', '') or len(ticker) > 5:
+        log_congress(f"🏁 Using {winner['name']} (freshest data: {winner['newest'] or 'undated'})")
+        trades, seen = [], set()
+        for row in winner['rows']:
+            if row['ticker'] in seen:
                 continue
-            if ticker in seen:
-                continue
-            seen.add(ticker)
-            action = 'buy' if 'purchase' in tx_type or 'buy' in tx_type else 'sell'
-            trades.append({'ticker': ticker, 'action': action})
-        
+            seen.add(row['ticker'])
+            trades.append({'ticker': row['ticker'], 'action': row['action']})
         log_congress(f"Found {len(trades)} unique tickers")
         return trades[:20]
     except Exception as e:
@@ -1009,7 +1217,7 @@ def congress_scan():
         save_state()
         return
 
-    log_congress("🏛️ Fetching congressional trades from Senate Stock Watcher...")
+    log_congress("🏛️ Polling all congressional data sources in parallel...")
     trades = get_congress_trades()
 
     if not trades:
@@ -1053,8 +1261,9 @@ def congress_scan():
             continue
         current_qty = held + pending_buy  # effective exposure incl. queued orders
 
-        if current_qty >= RULES['maxSharesPerStock']:
-            log_congress(f"⏭ {ticker} — max {RULES['maxSharesPerStock']} shares held/pending, skipping")
+        cap = rules_for(ticker)['maxSharesPerStock']
+        if current_qty >= cap:
+            log_congress(f"⏭ {ticker} — max {cap} shares held/pending, skipping{level_tag(ticker)}")
             continue
 
         try:
@@ -1067,12 +1276,12 @@ def congress_scan():
 
             # Cap the buy quantity so we never cross maxSharesPerStock,
             # even when maxPositionSize / price would normally buy more.
-            room_left = RULES['maxSharesPerStock'] - current_qty
+            room_left = cap - current_qty
             qty = max(1, min(room_left, int(RULES['maxPositionSize'] / price)))
             if qty <= 0:
                 continue
 
-            log_congress(f"📋 Copying congressional BUY: {ticker} @ ${price:.2f} (holding {current_qty}/{RULES['maxSharesPerStock']})")
+            log_congress(f"📋 Copying congressional BUY: {ticker} @ ${price:.2f} (holding {current_qty}/{cap})")
 
             or_ = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(),
                 json={"symbol": ticker, "qty": str(qty), "side": "buy", "type": "market", "time_in_force": "day"}, timeout=10)
@@ -1166,6 +1375,7 @@ def congress_status():
         "last_scan": congress_state['last_scan'],
         "scan_log": congress_state['scan_log'][:20],
         "trade_log": congress_state['trade_log'][:20],
+        "last_race": congress_state.get('last_race'),
         "copied_today": len([t for t in congress_state['copied_trades'] if t.startswith(datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d'))]),
     })
 
@@ -1620,6 +1830,69 @@ def ai_analyze():
 
 
 
+@app.route("/api/risk/get")
+def get_risk_level():
+    """Current level plus every level's description and the exact rule values
+    it sets, so a UI can show what choosing each one actually changes."""
+    return jsonify({
+        "level": engine_state.get('risk_level', 'balanced'),
+        "symbol_overrides": dict(engine_state.get('symbol_risk', {})),
+        "scan_list": MARKET_SCAN_LIST,
+        "profiles": {
+            k: {"label": v['label'], "description": v['description'],
+                "rules": v['rules'], "confluence_offset": v['confluence_offset']}
+            for k, v in RISK_PROFILES.items()
+        },
+    })
+
+@app.route("/api/risk/set", methods=["POST"])
+@require_api_key
+def set_risk_level():
+    data = request.get_json() or {}
+    level = str(data.get('level', '')).lower()
+    if level not in RISK_PROFILES:
+        return jsonify({"error": f"level must be one of: {', '.join(RISK_PROFILES)}"}), 400
+    previous = engine_state.get('risk_level', 'balanced')
+    apply_risk_profile(level)
+    save_state()
+    log_scan(f"🎚️ Risk level changed: {previous} → {level} "
+             f"(max {RULES['maxSharesPerStock']} shares/stock, stop {RULES['maxLossPct']}%, daily loss limit ${RULES['maxDailyLoss']})")
+    log_customer(f"🎚️ Risk level set to {RISK_PROFILES[level]['label']}. {RISK_PROFILES[level]['description']}")
+    return jsonify({"level": level, "rules": {k: RULES[k] for k in RISK_PROFILES[level]['rules']}})
+
+@app.route("/api/risk/symbol", methods=["POST"])
+@require_api_key
+def set_symbol_risk_level():
+    """Give one stock its own risk level, or clear it with level='default'.
+    Takes effect immediately for that stock's open position and future buys.
+    Everything account-wide (daily loss limit, bear-market buy block, no
+    shorting, weekly trade cap) is unaffected."""
+    data = request.get_json() or {}
+    symbol = str(data.get('symbol', '')).strip().upper()
+    level = str(data.get('level', '')).strip().lower()
+    if not re.fullmatch(r'[A-Z]{1,6}(\.[A-Z])?', symbol):
+        return jsonify({"error": "symbol must be a ticker like AAPL"}), 400
+    overrides = engine_state.setdefault('symbol_risk', {})
+    if level in ('default', 'account', ''):
+        removed = overrides.pop(symbol, None)
+        save_state()
+        if removed:
+            log_scan(f"🎚️ {symbol} risk override removed (was {removed}) — now follows the account level")
+            log_customer(f"🎚️ {symbol} now follows your account-wide risk level again.")
+        return jsonify({"symbol": symbol, "level": engine_state.get('risk_level', 'balanced'), "override": None})
+    if level not in RISK_PROFILES:
+        return jsonify({"error": f"level must be one of: {', '.join(RISK_PROFILES)}, or 'default'"}), 400
+    if symbol not in overrides and len(overrides) >= 25:
+        return jsonify({"error": "max 25 per-stock overrides"}), 400
+    previous = overrides.get(symbol)
+    overrides[symbol] = level
+    save_state()
+    prof = RISK_PROFILES[level]
+    log_scan(f"🎚️ {symbol} risk override: {previous or 'account level'} → {level} "
+             f"(stop {prof['rules']['maxLossPct']}%, max {prof['rules']['maxSharesPerStock']} shares)")
+    log_customer(f"🎚️ {symbol} set to {prof['label']}. {prof['description']}")
+    return jsonify({"symbol": symbol, "level": level, "override": level})
+
 @app.route("/api/settings/get")
 def get_settings():
     return jsonify(RULES)
@@ -1628,7 +1901,7 @@ def get_settings():
 @require_api_key
 def update_settings():
     data = request.get_json()
-    allowed = ['maxDailyLoss','maxTrades','maxPositionSize','maxLossPerTrade',
+    allowed = ['maxDailyLoss','maxTrades','maxPositionSize','maxLossPct',
                'takeProfitTarget','minConfidence','maxVolatility','minSyncScore',
                'maxSharesPerStock','takeProfitPct',
                'scaleOutTier1Pct','scaleOutTier1Frac','scaleOutTier2Pct','scaleOutTier2Frac','scaleOutTier3Pct']

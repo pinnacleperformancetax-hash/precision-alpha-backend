@@ -1117,19 +1117,30 @@ def _fetch_congress_source(src):
     result = {'name': src['name'], 'ok': False, 'rows': [], 'newest': '', 'error': '', 'ms': 0}
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
-        key = os.environ.get('BARGO_API_KEY')
-        if src['kind'] == 'bargo' and key:
-            headers['X-Api-Key'] = key
+        if src['kind'] == 'bargo':
+            # Identify ourselves honestly: a spoofed browser User-Agent from a
+            # datacenter IP is exactly what bot protection tends to refuse.
+            headers = {"User-Agent": "PrecisionAlphaAI/1.0 (congress-trades client)", "Accept": "application/json"}
+            key = os.environ.get('BARGO_API_KEY')
+            if key:
+                headers['X-Api-Key'] = key
         res = requests.get(src['url'], headers=headers, timeout=15)
         result['ms'] = int((time.time() - started) * 1000)
+        snippet = (res.text or '')[:100].replace('\n', ' ').strip()
         if not res.ok:
-            result['error'] = f"HTTP {res.status_code}"
+            # Include the start of the response body — a bare "HTTP 403" doesn't
+            # say WHY (rate limit, bot protection, bad key), but the body usually does.
+            result['error'] = f"HTTP {res.status_code}" + (f" — {snippet}" if snippet else "")
             if res.status_code == 429 and src['kind'] == 'bargo':
                 result['error'] += " (daily limit reached — set BARGO_API_KEY on Render)"
             elif res.status_code == 401 and src['kind'] == 'bargo':
                 result['error'] += " (BARGO_API_KEY rejected)"
             return result
-        data = res.json()
+        try:
+            data = res.json()
+        except ValueError:
+            result['error'] = f"HTTP {res.status_code} but not JSON ({res.headers.get('Content-Type', 'unknown type')}): {snippet}"
+            return result
         rows = data.get('trades') if isinstance(data, dict) else data
         if not isinstance(rows, list):
             result['error'] = 'unexpected response shape'

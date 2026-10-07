@@ -867,6 +867,40 @@ def note_trade(symbol, side):
     except Exception as e:
         logger.warning(f"note_trade failed for {symbol}: {e}")
 
+_cooldown_seed = {'ts': 0.0}
+
+def _seed_cooldowns_from_fills():
+    """Rebuild cooldown timers from Alpaca's own fill history, so they survive a
+    redeploy/restart (memory and /tmp are wiped on deploy, Alpaca's records
+    aren't). Looks only at fills inside the cooldown window and keeps whichever
+    time is newer. Note: fills include MANUAL trades too, so a stock you just
+    traded by hand also starts a cooldown for the engine's AI signals.
+    Cheap: runs at most every 30 seconds and reuses the ledger's fill cache."""
+    try:
+        mins = RULES.get('cooldownMinutes', 0) or 0
+        if mins <= 0 or time.time() - _cooldown_seed['ts'] < 30:
+            return
+        _cooldown_seed['ts'] = time.time()
+        sync_ledger_from_fills(max_age=60)  # make sure recent fills are loaded
+        cutoff = time.time() - mins * 60
+        cds = engine_state.setdefault('cooldowns', {})
+        for f in reversed(_fill_cache['fills']):  # newest first
+            try:
+                t = datetime.fromisoformat(f['transaction_time'].replace('Z', '+00:00')).timestamp()
+            except Exception:
+                continue
+            if t < cutoff:
+                break  # fills are oldest-to-newest, everything before this is older still
+            sym = f.get('symbol') or ''
+            if not sym or _OCC_RE.match(sym):
+                continue  # stocks only; options aren't traded by the engine
+            side = 'buy' if str(f.get('side', '')).lower() == 'buy' else 'sell'
+            slot = cds.setdefault(sym, {})
+            if t > slot.get(side, 0):
+                slot[side] = t
+    except Exception as e:
+        logger.warning(f"cooldown seed failed: {e}")
+
 def cooldown_left(symbol, last_side):
     """Minutes still left on the cooldown since the engine's last `last_side`
     ('buy' or 'sell') trade of this symbol; 0 if none/expired/disabled."""
@@ -874,6 +908,7 @@ def cooldown_left(symbol, last_side):
         mins = RULES.get('cooldownMinutes', 0) or 0
         if mins <= 0:
             return 0
+        _seed_cooldowns_from_fills()
         t = engine_state.get('cooldowns', {}).get(symbol, {}).get(last_side)
         if not t:
             return 0

@@ -2589,21 +2589,40 @@ def update_benchmark():
     benchmark_state['history'] = benchmark_state['history'][:30]
     return jsonify({"status": "saved", "real_value": val})
 
-# Auto-start engines on boot — only once
-if not _engine_started:
-    _engine_started = True
-    engine_state['running'] = True
-    threading.Thread(target=engine_loop, daemon=True).start()
-    log_scan("🚀 Auto engine started on server boot")
+# ---- Background threads: engine, Congress engine, weekly email ----
+# Started from inside the process that SERVES requests, never at import time.
+# gunicorn can import this file in its master process and then fork the worker.
+# Threads don't survive a fork, so threads started at import lived in the master
+# while the dashboard talked to a worker copy that had none: Stop/Start and
+# settings changes never reached the real engine, and any lock held at the
+# moment of the fork stayed locked forever in the worker (that is also what
+# caused the old netrc "SystemExit" blips). Now each process starts its own
+# threads on its first request — Render's health check hits "/" seconds after
+# boot — and only once per process.
+_threads_pid = None
+_threads_lock = threading.Lock()
 
-if not _congress_started:
-    _congress_started = True
-    congress_state['running'] = True
-    threading.Thread(target=congress_loop, daemon=True).start()
-    log_congress("🏛️ Congressional copy engine started on server boot")
+def ensure_background_threads():
+    global _threads_pid
+    pid = os.getpid()
+    if _threads_pid == pid:
+        return
+    with _threads_lock:
+        if _threads_pid == pid:
+            return
+        _threads_pid = pid
+        engine_state['running'] = True
+        threading.Thread(target=engine_loop, daemon=True).start()
+        log_scan("🚀 Auto engine started on server boot")
+        congress_state['running'] = True
+        threading.Thread(target=congress_loop, daemon=True).start()
+        log_congress("🏛️ Congressional copy engine started on server boot")
+        # Runs independently of engine on/off state — always checking for Saturday.
+        threading.Thread(target=weekly_email_loop, daemon=True).start()
 
-# Runs independently of engine on/off state — always checking for Saturday.
-threading.Thread(target=weekly_email_loop, daemon=True).start()
+@app.before_request
+def _boot_background_threads():
+    ensure_background_threads()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

@@ -148,6 +148,10 @@ _state_lock = threading.Lock()
 # package. Writes happen in a background thread at most every ~3 seconds and
 # NEVER block or break trading: a failure is logged and retried on the next save.
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+# Forgiving about how the URL was typed: a bare project id like "abcdxyz" or
+# "abcdxyz.supabase.co" becomes "https://abcdxyz.supabase.co".
+if SUPABASE_URL and not SUPABASE_URL.startswith(("http://", "https://")):
+    SUPABASE_URL = "https://" + (SUPABASE_URL if "." in SUPABASE_URL else SUPABASE_URL + ".supabase.co")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
 SUPABASE_TABLE = os.environ.get("SUPABASE_STATE_TABLE", "app_state")
 SUPABASE_ROW = os.environ.get("SUPABASE_STATE_ROW", "main")
@@ -166,7 +170,11 @@ except Exception:
     pass
 
 def _sb_headers(extra=None):
-    h = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+    h = {"apikey": SUPABASE_SERVICE_KEY}
+    # Newer "sb_secret_..." keys are not JWTs and go in the apikey header alone;
+    # the older "service_role" key (a long eyJ... JWT) also goes in Authorization.
+    if not SUPABASE_SERVICE_KEY.startswith("sb_"):
+        h["Authorization"] = f"Bearer {SUPABASE_SERVICE_KEY}"
     if extra:
         h.update(extra)
     return h
@@ -195,6 +203,9 @@ def _remote_writer():
         if not _remote['dirty']:
             continue
         _remote['dirty'] = False
+        if _remote['last_error'] and time.time() - _remote.get('err_ts', 0) < 30:
+            _remote['dirty'] = True  # last save failed: wait 30s before trying again (no log spam)
+            continue
         try:
             with _state_lock:
                 payload = {'engine_state': engine_state, 'congress_state': congress_state, '_saved_at': time.time()}
@@ -209,11 +220,13 @@ def _remote_writer():
                 _remote['last_ok'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
                 _remote['last_error'] = None
             else:
-                _remote['dirty'] = True  # try again next round
+                _remote['dirty'] = True  # try again later
+                _remote['err_ts'] = time.time()
                 _remote['last_error'] = f"save HTTP {r.status_code}: {r.text[:120]}"
                 logger.error(f"Supabase state save failed: {_remote['last_error']}")
         except Exception as e:
             _remote['dirty'] = True
+            _remote['err_ts'] = time.time()
             _remote['last_error'] = f"save: {str(e)[:120]}"
             logger.error(f"Supabase state save failed: {e}")
 
@@ -1681,6 +1694,12 @@ CONGRESS_SOURCES = [
     # credit linking to Bargo wherever the data is DISPLAYED to users.
     {'name': 'Bargo API (House+Senate)', 'kind': 'bargo',
      'url': "https://www.bargo.ai/free-apis/congress/v1/trades?limit=100"},
+    # Disclosed Capitol: free tier = last 90 days. Needs a free key in the
+    # DISCLOSED_CAPITOL_KEY environment variable on Render (sent as DC-API-Key).
+    # Their docs don't show this feed's exact field names, so the parser below
+    # tries several likely ones, and 'sample' in last_race shows the raw first row.
+    {'name': 'Disclosed Capitol', 'kind': 'dcapitol',
+     'url': "https://api.disclosedcapitol.com/trades/recent?limit=100"},
 ]
 
 def _parse_date(s):
@@ -1705,15 +1724,28 @@ def _action_from_type(tx):
         return 'sell'
     return None  # unknown type: skip rather than guess a direction
 
+def _pick_ticker(item):
+    """Ticker from whichever field a source uses (some nest it under 'asset')."""
+    for k in ('ticker', 'symbol', 'stock_ticker', 'asset_ticker'):
+        v = item.get(k)
+        if v:
+            return str(v).strip().upper()
+    a = item.get('asset')
+    if isinstance(a, dict):
+        for k in ('ticker', 'symbol'):
+            if a.get(k):
+                return str(a[k]).strip().upper()
+    return ''
+
 def _normalize_congress_rows(rows):
     out = []
     for item in rows:
         if not isinstance(item, dict):
             continue
-        ticker = str(item.get('ticker') or '').strip().upper()
+        ticker = _pick_ticker(item)
         if not ticker or ticker in ('--', 'N/A') or len(ticker) > 5:
             continue
-        action = _action_from_type(item.get('type') or item.get('transaction_type'))
+        action = _action_from_type(item.get('type') or item.get('transaction_type') or item.get('trade_type'))
         if not action:
             continue
         date = max(_parse_date(item.get('transaction_date')), _parse_date(item.get('disclosure_date')))
@@ -1735,6 +1767,13 @@ def _fetch_congress_source(src):
             key = os.environ.get('BARGO_API_KEY')
             if key:
                 headers['X-Api-Key'] = key
+        if src['kind'] == 'dcapitol':
+            key = os.environ.get('DISCLOSED_CAPITOL_KEY', '').strip()
+            if not key:
+                result['error'] = 'DISCLOSED_CAPITOL_KEY is not set on Render'
+                return result
+            headers = {"User-Agent": "PrecisionAlphaAI/1.0 (congress-trades client)", "Accept": "application/json",
+                       "DC-API-Key": key}
         res = requests.get(src['url'], headers=headers, timeout=15)
         result['ms'] = int((time.time() - started) * 1000)
         snippet = (res.text or '')[:100].replace('\n', ' ').strip()
@@ -1746,16 +1785,26 @@ def _fetch_congress_source(src):
                 result['error'] += " (daily limit reached — set BARGO_API_KEY on Render)"
             elif res.status_code == 401 and src['kind'] == 'bargo':
                 result['error'] += " (BARGO_API_KEY rejected)"
+            elif res.status_code in (401, 403) and src['kind'] == 'dcapitol':
+                result['error'] += " (check DISCLOSED_CAPITOL_KEY on Render)"
             return result
         try:
             data = res.json()
         except ValueError:
             result['error'] = f"HTTP {res.status_code} but not JSON ({res.headers.get('Content-Type', 'unknown type')}): {snippet}"
             return result
-        rows = data.get('trades') if isinstance(data, dict) else data
+        rows = data
+        if isinstance(data, dict):
+            rows = None
+            for k in ('trades', 'data', 'results', 'items'):
+                if isinstance(data.get(k), list):
+                    rows = data[k]
+                    break
         if not isinstance(rows, list):
-            result['error'] = 'unexpected response shape'
+            result['error'] = 'unexpected response shape' + (f" (keys: {list(data)[:8]})" if isinstance(data, dict) else '')
             return result
+        if rows:
+            result['sample'] = json.dumps(rows[0], default=str)[:400]  # raw first row, for debugging field names
         norm = _normalize_congress_rows(rows)
         result['rows'] = norm
         result['newest'] = max((r['date'] for r in norm), default='')
@@ -1796,7 +1845,8 @@ def get_congress_trades():
             'time': datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d %I:%M %p'),
             'winner': winner['name'] if winner else None,
             'sources': [{'name': r['name'], 'ok': r['ok'], 'trades': len(r['rows']),
-                         'newest': r['newest'], 'ms': r['ms'], 'error': r['error']} for r in results],
+                         'newest': r['newest'], 'ms': r['ms'], 'error': r['error'],
+                         'sample': r.get('sample', '')} for r in results],
         }
         if not winner:
             # Previously this returned a hardcoded list (NVDA/MSFT/AAPL/AMZN/GOOGL) and

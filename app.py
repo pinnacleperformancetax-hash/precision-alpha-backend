@@ -80,6 +80,11 @@ RULES = {
     'scaleOutTier1Pct': 5,  'scaleOutTier1Frac': 0.34,
     'scaleOutTier2Pct': 10, 'scaleOutTier2Frac': 0.33,
     'scaleOutTier3Pct': 15,  # sells 100% of whatever's left at this gain
+    # Anti-churn cooldown (minutes): after the engine BUYS a stock it ignores
+    # AI sell signals on it for this long; after it SELLS a stock it won't buy
+    # it back for this long. Stop-losses and profit scale-outs ignore the
+    # buy-side cooldown (they always fire). 0 turns the cooldown off.
+    'cooldownMinutes': 30,
 }
 
 engine_state = {
@@ -854,6 +859,29 @@ def stock_today_pl(symbol, held, price, day_open):
         logger.warning(f"per-stock P&L failed for {symbol}: {e}")
         return None
 
+def note_trade(symbol, side):
+    """Remember when the engine last bought/sold this symbol (for the cooldown).
+    Stored in engine_state so it survives a restart (not a redeploy)."""
+    try:
+        engine_state.setdefault('cooldowns', {}).setdefault(symbol, {})[side] = time.time()
+    except Exception as e:
+        logger.warning(f"note_trade failed for {symbol}: {e}")
+
+def cooldown_left(symbol, last_side):
+    """Minutes still left on the cooldown since the engine's last `last_side`
+    ('buy' or 'sell') trade of this symbol; 0 if none/expired/disabled."""
+    try:
+        mins = RULES.get('cooldownMinutes', 0) or 0
+        if mins <= 0:
+            return 0
+        t = engine_state.get('cooldowns', {}).get(symbol, {}).get(last_side)
+        if not t:
+            return 0
+        left = mins - (time.time() - t) / 60.0
+        return left if left > 0 else 0
+    except Exception:
+        return 0
+
 def _sell_shares(symbol, qty, current_price, reason, unrealized_pl_for_log, avg_entry=None):
     """Places the actual sell order and records it. Shared by the stop-loss,
     tiered scale-out, and final full-exit paths below so the order-placement
@@ -867,6 +895,7 @@ def _sell_shares(symbol, qty, current_price, reason, unrealized_pl_for_log, avg_
         engine_state['trade_log'].insert(0, entry)
         engine_state['trade_log'] = engine_state['trade_log'][:50]
         engine_state['today_pl'] += unrealized_pl_for_log
+        note_trade(symbol, 'sell')
         if avg_entry:
             record_realized(symbol, qty, avg_entry, current_price, reason, 'engine')
         save_state()
@@ -1400,6 +1429,10 @@ def auto_scan():
                 if sellable <= 0:
                     log_scan(f"⏭ {symbol} — SELL signal but no long shares to sell (shorting disabled), skipping")
                     continue
+                left = cooldown_left(symbol, 'buy')
+                if left > 0:
+                    log_scan(f"⏳ {symbol} — SELL signal ignored: bought it recently, cooldown {left:.0f} more min (stop-loss still active)")
+                    continue
                 current_qty = held
             else:
                 current_qty = max(held, 0) + pending_buy  # effective exposure incl. queued orders
@@ -1408,6 +1441,10 @@ def auto_scan():
                     continue
                 if current_qty >= r['maxSharesPerStock']:
                     log_scan(f"⏭ {symbol} — max {r['maxSharesPerStock']} shares held/pending, skipping{level_tag(symbol)}")
+                    continue
+                left = cooldown_left(symbol, 'sell')
+                if left > 0:
+                    log_scan(f"⏳ {symbol} — BUY signal ignored: sold it recently, cooldown {left:.0f} more min")
                     continue
                 # Per-stock daily loss: this ONE stock is down too much today,
                 # so no more buys of it until tomorrow. Other stocks carry on.
@@ -1442,6 +1479,7 @@ def auto_scan():
                 json={"symbol": symbol, "qty": str(qty), "side": side, "type": "market", "time_in_force": "day"}, timeout=10)
             if not or_.ok:
                 log_scan(f"❌ {symbol} — order failed"); continue
+            note_trade(symbol, side)
             if side == 'sell' and sell_entry:
                 record_realized(symbol, qty, sell_entry, price, "AI sell signal", 'ai')
 

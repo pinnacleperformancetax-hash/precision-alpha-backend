@@ -139,13 +139,104 @@ congress_state = {
 STATE_FILE = os.environ.get("STATE_FILE_PATH", "/tmp/precision_alpha_state.json")
 _state_lock = threading.Lock()
 
+# ---- Durable copy in Supabase (survives deploys) ----
+# The local file above is wiped by every deploy. If SUPABASE_URL and
+# SUPABASE_SERVICE_KEY are set on Render, the same state is ALSO written to one
+# row of a Supabase table (default: app_state, row id 'main') and read back on
+# boot, so vault settings, withdrawals, the chosen risk level, cooldowns and
+# the Congress de-dupe list all survive a redeploy. Plain REST calls, no extra
+# package. Writes happen in a background thread at most every ~3 seconds and
+# NEVER block or break trading: a failure is logged and retried on the next save.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+SUPABASE_TABLE = os.environ.get("SUPABASE_STATE_TABLE", "app_state")
+SUPABASE_ROW = os.environ.get("SUPABASE_STATE_ROW", "main")
+_remote = {'enabled': bool(SUPABASE_URL and SUPABASE_SERVICE_KEY), 'dirty': False, 'pid': None,
+           'last_ok': None, 'last_error': None, 'saves': 0, 'loaded_from': 'nothing yet'}
+_remote_lock = threading.Lock()
+
+def _reset_remote_after_fork():
+    """A forked worker doesn't inherit the writer thread; let it start its own."""
+    global _remote_lock
+    _remote_lock = threading.Lock()
+    _remote['pid'] = None
+try:
+    os.register_at_fork(after_in_child=_reset_remote_after_fork)
+except Exception:
+    pass
+
+def _sb_headers(extra=None):
+    h = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+    if extra:
+        h.update(extra)
+    return h
+
+def _remote_load():
+    """The saved state dict from Supabase, or None (not configured / no row / error)."""
+    if not _remote['enabled']:
+        return None
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}", headers=_sb_headers(),
+                         params={'id': f'eq.{SUPABASE_ROW}', 'select': 'data'}, timeout=10)
+        if not r.ok:
+            _remote['last_error'] = f"load HTTP {r.status_code}: {r.text[:120]}"
+            logger.error(f"Supabase state load failed: {_remote['last_error']}")
+            return None
+        rows = r.json()
+        return rows[0].get('data') if rows else None
+    except Exception as e:
+        _remote['last_error'] = f"load: {str(e)[:120]}"
+        logger.error(f"Supabase state load failed: {e}")
+        return None
+
+def _remote_writer():
+    while True:
+        time.sleep(3)
+        if not _remote['dirty']:
+            continue
+        _remote['dirty'] = False
+        try:
+            with _state_lock:
+                payload = {'engine_state': engine_state, 'congress_state': congress_state, '_saved_at': time.time()}
+                body = json.dumps({'id': SUPABASE_ROW, 'data': payload,
+                                   'updated_at': datetime.utcnow().isoformat() + 'Z'})
+            r = requests.post(f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}",
+                              headers=_sb_headers({'Content-Type': 'application/json',
+                                                   'Prefer': 'resolution=merge-duplicates'}),
+                              data=body, timeout=15)
+            if r.ok:
+                _remote['saves'] += 1
+                _remote['last_ok'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+                _remote['last_error'] = None
+            else:
+                _remote['dirty'] = True  # try again next round
+                _remote['last_error'] = f"save HTTP {r.status_code}: {r.text[:120]}"
+                logger.error(f"Supabase state save failed: {_remote['last_error']}")
+        except Exception as e:
+            _remote['dirty'] = True
+            _remote['last_error'] = f"save: {str(e)[:120]}"
+            logger.error(f"Supabase state save failed: {e}")
+
+def _remote_kick():
+    """Mark state changed and make sure this process has a writer thread."""
+    if not _remote['enabled']:
+        return
+    _remote['dirty'] = True
+    if _remote['pid'] != os.getpid():
+        with _remote_lock:
+            if _remote['pid'] != os.getpid():
+                _remote['pid'] = os.getpid()
+                threading.Thread(target=_remote_writer, daemon=True).start()
+
 def save_state():
     try:
         with _state_lock:
             with open(STATE_FILE, 'w') as f:
-                json.dump({'engine_state': engine_state, 'congress_state': congress_state}, f)
+                json.dump({'engine_state': engine_state, 'congress_state': congress_state,
+                           '_saved_at': time.time()}, f)
     except Exception as e:
         logger.error(f"Failed to save state: {e}")
+    _remote_kick()
 
 # ---- Risk levels ----
 # Each level overwrites a bundle of RULES together so they stay coherent
@@ -240,15 +331,32 @@ def level_tag(symbol):
     return f" [{RISK_PROFILES[level_for(symbol)]['label']}]" if has_override(symbol) else ""
 
 def load_state():
+    """Restore from whichever copy is NEWER: the local file (survives restarts)
+    or Supabase (also survives deploys). Falls back to starting fresh."""
+    file_data, file_t = None, 0.0
     try:
-        if not os.path.exists(STATE_FILE):
-            logger.info("No saved state file found — starting fresh")
-            return
-        with open(STATE_FILE, 'r') as f:
-            data = json.load(f)
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, 'r') as f:
+                file_data = json.load(f)
+            file_t = float(file_data.get('_saved_at') or os.path.getmtime(STATE_FILE))
+    except Exception as e:
+        logger.error(f"Failed to read state file: {e}")
+        file_data = None
+    remote_data = _remote_load()
+    remote_t = float((remote_data or {}).get('_saved_at') or 0) if remote_data else 0.0
+    if remote_data and (file_data is None or remote_t >= file_t):
+        data, src = remote_data, 'Supabase'
+    elif file_data is not None:
+        data, src = file_data, STATE_FILE
+    else:
+        _remote['loaded_from'] = 'nothing (fresh start)'
+        logger.info("No saved state found — starting fresh")
+        return
+    try:
         engine_state.update(data.get('engine_state', {}))
         congress_state.update(data.get('congress_state', {}))
-        logger.info(f"✅ Restored state from {STATE_FILE} — congress copied_trades: {len(congress_state.get('copied_trades', []))}, engine running: {engine_state.get('running')}")
+        _remote['loaded_from'] = src
+        logger.info(f"✅ Restored state from {src} — congress copied_trades: {len(congress_state.get('copied_trades', []))}, engine running: {engine_state.get('running')}")
     except Exception as e:
         logger.error(f"Failed to load state, starting fresh: {e}")
 
@@ -2443,6 +2551,19 @@ def set_vault():
              f"cap {'ON' if v['cap_enabled'] else 'off'}, refill-first {'ON' if v['refill_first'] else 'off'}")
     return jsonify({"trading_start": v['trading_start'], "cap_enabled": v['cap_enabled'],
                     "refill_first": v['refill_first'], "trading_balance": vault_trading_balance()})
+
+@app.route("/api/storage/status")
+def storage_status():
+    """Is the durable (Supabase) copy of the app's state working? No secrets here."""
+    return jsonify({
+        "supabase_configured": _remote['enabled'],
+        "loaded_from": _remote['loaded_from'],
+        "saves_this_boot": _remote['saves'],
+        "last_save_ok": _remote['last_ok'],
+        "last_error": _remote['last_error'],
+        "table": SUPABASE_TABLE if _remote['enabled'] else None,
+        "pid": os.getpid(),
+    })
 
 @app.route("/api/risk/get")
 def get_risk_level():

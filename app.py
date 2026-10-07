@@ -1612,6 +1612,13 @@ def auto_scan():
                         log_customer(f"🔻 {symbol} — Paused for today. It's down ${-stock_pl:.2f} on its own, past your ${stock_limit:.0f} per-stock limit. Other stocks keep trading.")
                         continue
 
+            # A full scan takes ~90 seconds, so the 4:00 PM close can pass while a
+            # scan is running. Re-check right before ordering (cached clock) so an
+            # order is never queued overnight for the next open.
+            if not is_market_hours():
+                log_scan(f"⏰ {symbol} — market closed during this scan, not placing the order")
+                break
+
             qty = 1  # Always buy 1 share at a time
             # A buy on a symbol already holding shares IS scaling in — it's
             # only allowed to reach here because the SAME confluence bar that
@@ -2492,7 +2499,11 @@ def orders():
                 })
                 save_state()
         else:
-            res = requests.get(f"{ALPACA_BASE_URL}/orders?status={request.args.get('status','all')}&limit={request.args.get('limit','50')}", headers=alpaca_hdrs(), timeout=10)
+            q = f"status={request.args.get('status','all')}&limit={request.args.get('limit','50')}"
+            after = request.args.get('after', '')
+            if after and re.fullmatch(r'[0-9TZ:.+-]{8,40}', after):  # ISO timestamp only
+                q += f"&after={after}"
+            res = requests.get(f"{ALPACA_BASE_URL}/orders?{q}", headers=alpaca_hdrs(), timeout=10)
         return jsonify(res.json()), res.status_code
     except Exception as e: return jsonify({"error": str(e)}), 500
 

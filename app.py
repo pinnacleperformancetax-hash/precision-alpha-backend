@@ -299,18 +299,60 @@ def reset_if_needed():
     if changed:
         save_state()
 
+_open_eq = {'date': None, 'val': None}
+
+def get_opening_equity():
+    """Account equity at today's 9:30 AM ET open, from Alpaca's portfolio
+    history (so a server restart can't lose it). None if there is no bar for
+    today's open yet (pre-market, weekend) or the lookup failed.
+
+    Why: Alpaca's own `last_equity` is the 4:00 PM close. Measuring "today's
+    loss" from it counted after-hours and overnight price moves, so the daily
+    loss limit could trip before the market even opened (Oct 7: -$120.80 shown
+    while the account was +$3.81 since the night before)."""
+    tz = pytz.timezone('America/New_York')
+    today = datetime.now(tz).strftime('%Y-%m-%d')
+    if _open_eq['date'] == today and _open_eq['val'] is not None:
+        return _open_eq['val']
+    try:
+        r = requests.get(f"{ALPACA_BASE_URL}/account/portfolio/history", headers=alpaca_hdrs(),
+                         params={'period': '1D', 'timeframe': '15Min',
+                                 'intraday_reporting': 'market_hours', 'pnl_reset': 'per_day'},
+                         timeout=10)
+        if r.ok:
+            d = r.json()
+            for t, e in zip(d.get('timestamp') or [], d.get('equity') or []):
+                if e is None:
+                    continue
+                bar = datetime.fromtimestamp(t, tz)
+                if bar.strftime('%Y-%m-%d') == today and (bar.hour, bar.minute) >= (9, 30):
+                    _open_eq['date'], _open_eq['val'] = today, float(e)
+                    return _open_eq['val']
+        else:
+            logger.warning(f"portfolio history lookup failed: HTTP {r.status_code}")
+    except Exception as e:
+        logger.warning(f"opening equity lookup failed: {e}")
+    return None
+
 def get_real_today_pl():
-    """Get actual today P&L from Alpaca account"""
+    """Today's P&L = current equity minus equity at today's 9:30 AM open."""
     try:
         res = requests.get(f"{ALPACA_BASE_URL}/account", headers=alpaca_hdrs(), timeout=10)
         if not res.ok:
             return engine_state['today_pl']
         data = res.json()
-        # equity - last_equity = today's P&L
         equity = float(data.get('equity', 0))
-        last_equity = float(data.get('last_equity', equity))
-        today_pl = equity - last_equity
-        return today_pl
+        base = get_opening_equity()
+        if base is None:
+            est = datetime.now(pytz.timezone('America/New_York'))
+            if est.weekday() < 5 and (est.hour, est.minute) >= (9, 35):
+                # Market has been open a few minutes but the open couldn't be
+                # read: fall back to the prior close (the strict, old behavior)
+                # rather than quietly switching the loss limit off.
+                base = float(data.get('last_equity', equity))
+            else:
+                base = equity  # pre-market / weekend: nothing has happened today
+        return equity - base
     except:
         return engine_state['today_pl']
 
@@ -477,6 +519,8 @@ def check_and_send_weekly_email():
 # market orders can fill a few cents away from that price. Not tracked: manual
 # sells from the Trade page. Lives in engine_state, so like everything else in
 # it, it is wiped by a fresh deploy ('since' shows when tracking began).
+# UPDATE: no longer true for the totals. They are rebuilt from Alpaca's fill
+# history (sync_ledger_from_fills below), so deploys and restarts don't lose them.
 def _ledger():
     led = engine_state.setdefault('profit_ledger', {})
     led.setdefault('entries', [])
@@ -497,29 +541,135 @@ def get_avg_entry(symbol):
     return None
 
 def record_realized(symbol, qty, entry_price, exit_price, reason, source):
+    """The ledger is now DERIVED from Alpaca's fill history (see
+    sync_ledger_from_fills), not accumulated here, so a restart or deploy can't
+    erase it and nothing is counted twice. Call sites stay as they are; this
+    just makes the next read re-sync so a fresh sell shows up promptly."""
+    _ledger_sync['ts'] = 0.0
+
+# ---- Ledger from Alpaca fills ----
+# Realized profit = FIFO match of every sell against the earlier buys of the same
+# symbol, using Alpaca's own fill records (engine AND manual trades). History
+# back to LEDGER_HISTORY_FROM is read only to price the shares; just sells on or
+# after LEDGER_SINCE are counted. Options contracts are x100.
+LEDGER_SINCE = os.environ.get('LEDGER_SINCE', '2026-10-06')
+LEDGER_HISTORY_FROM = os.environ.get('LEDGER_HISTORY_FROM', '2026-08-01')
+_OCC_RE = re.compile(r'^[A-Z]{1,6}\d{6}[CP]\d{8}$')
+_fill_cache = {'fills': [], 'ids': set(), 'last_time': None}
+_ledger_sync = {'ts': 0.0, 'ok': None, 'unmatched': 0.0, 'fills': 0, 'last_sync': None}
+_ledger_lock = threading.Lock()
+
+def _week_key_for(d):
+    return f"{d.year}-W{d.isocalendar()[1]}"  # same format as get_week_key()
+
+def _fetch_new_fills():
+    """Reads fills we haven't seen yet (everything on the first call). Returns
+    False if Alpaca couldn't be read."""
+    params = {'direction': 'asc', 'page_size': 100,
+              'after': _fill_cache['last_time'] or (LEDGER_HISTORY_FROM + 'T00:00:00Z')}
+    for _ in range(80):  # 80 pages x 100 fills is far more than this account has
+        r = requests.get(f"{ALPACA_BASE_URL}/account/activities/FILL", headers=alpaca_hdrs(), params=params, timeout=20)
+        if not r.ok:
+            logger.error(f"fill history lookup failed: HTTP {r.status_code}")
+            return False
+        rows = r.json()
+        if not rows:
+            return True
+        for f in rows:
+            fid = f.get('id')
+            if fid in _fill_cache['ids']:
+                continue  # `after` can repeat the last fill we already have
+            _fill_cache['ids'].add(fid)
+            _fill_cache['fills'].append(f)
+            if f.get('transaction_time'):
+                _fill_cache['last_time'] = f['transaction_time']
+        if len(rows) < 100:
+            return True
+        params['page_token'] = rows[-1].get('id')
+    return True
+
+def _compute_realized(fills):
+    """FIFO-match sells against earlier buys. Returns (events, unmatched_shares).
+    One event per closing fill, with a share-weighted entry price."""
+    from collections import deque
+    et = pytz.timezone('America/New_York')
+    lots, events, unmatched = {}, [], 0.0
+    for f in sorted(fills, key=lambda x: x.get('transaction_time') or ''):
+        try:
+            sym, q, p = f['symbol'], float(f['qty']), float(f['price'])
+            t = datetime.fromisoformat(f['transaction_time'].replace('Z', '+00:00')).astimezone(et)
+        except Exception:
+            continue
+        if q <= 0 or p <= 0:
+            continue
+        side = str(f.get('side', '')).lower()
+        buying = side == 'buy'
+        mult = 100 if _OCC_RE.match(sym) else 1
+        dq = lots.setdefault(sym, deque())
+        remaining, matched, cost, pnl = q, 0.0, 0.0, 0.0
+        while remaining > 1e-9 and dq and ((buying and dq[0][0] < 0) or (not buying and dq[0][0] > 0)):
+            lot_q, lot_p = dq[0]
+            m = min(abs(lot_q), remaining)
+            pnl += ((p - lot_p) if lot_q > 0 else (lot_p - p)) * m * mult
+            cost += lot_p * m
+            matched += m
+            left = abs(lot_q) - m
+            if left <= 1e-9:
+                dq.popleft()
+            else:
+                dq[0] = [left if lot_q > 0 else -left, lot_p]
+            remaining -= m
+        if matched > 0:
+            events.append({'dt': t, 'date': t.strftime('%Y-%m-%d'), 'time': t.strftime('%I:%M %p'),
+                           'symbol': sym, 'qty': int(matched) if matched % 1 == 0 else round(matched, 2),
+                           'entry': round(cost / matched, 2), 'exit': round(p, 2),
+                           'pnl': round(pnl, 2), 'reason': 'Sold', 'source': 'alpaca'})
+        if remaining > 1e-9:
+            if buying:
+                dq.append([remaining, p])
+            elif side == 'sell_short':
+                dq.append([-remaining, p])
+            else:
+                unmatched += remaining  # a sell whose buy is older than the history window
+    return events, unmatched
+
+def sync_ledger_from_fills(max_age=60, force=False):
+    """Rebuild the profit ledger from Alpaca's fill history (cached, incremental).
+    Safe to call often: skips if synced within max_age seconds or if another
+    sync is already running. A failed lookup keeps the last good ledger."""
+    if not force and time.time() - _ledger_sync['ts'] < max_age:
+        return
+    if not _ledger_lock.acquire(blocking=False):
+        return
     try:
-        entry_price, exit_price, qty = float(entry_price), float(exit_price), int(qty)
-        if entry_price <= 0 or exit_price <= 0 or qty <= 0:
+        ok = _fetch_new_fills()
+        if not ok and not _fill_cache['fills']:
+            _ledger_sync['ts'] = time.time() - max_age + 15  # retry in ~15s
+            _ledger_sync['ok'] = False
             return
-        pnl = round((exit_price - entry_price) * qty, 2)
-        est = datetime.now(pytz.timezone('America/New_York'))
-        day, wk = est.strftime('%Y-%m-%d'), get_week_key()
+        events, unmatched = _compute_realized(_fill_cache['fills'])
+        events = [e for e in events if e['date'] >= LEDGER_SINCE]
         led = _ledger()
-        led['total'] = round(led['total'] + pnl, 2)
-        led['by_day'][day] = round(led['by_day'].get(day, 0.0) + pnl, 2)
-        led['by_week'][wk] = round(led['by_week'].get(wk, 0.0) + pnl, 2)
-        while len(led['by_day']) > 30:
-            led['by_day'].pop(next(iter(led['by_day'])))
-        while len(led['by_week']) > 12:
-            led['by_week'].pop(next(iter(led['by_week'])))
-        led['entries'].insert(0, {
-            'date': day, 'time': est.strftime('%I:%M %p'), 'symbol': symbol, 'qty': qty,
-            'entry': round(entry_price, 2), 'exit': round(exit_price, 2), 'pnl': pnl,
-            'reason': str(reason)[:60], 'source': source,
-        })
-        led['entries'] = led['entries'][:300]
+        by_day, by_week = {}, {}
+        for e in events:
+            by_day[e['date']] = round(by_day.get(e['date'], 0.0) + e['pnl'], 2)
+            wk = _week_key_for(e['dt'])
+            by_week[wk] = round(by_week.get(wk, 0.0) + e['pnl'], 2)
+        led['total'] = round(sum(e['pnl'] for e in events), 2)
+        led['by_day'] = dict(sorted(by_day.items())[-30:])
+        led['by_week'] = dict(list(by_week.items())[-12:])
+        led['since'] = LEDGER_SINCE
+        led['entries'] = [{k: v for k, v in e.items() if k != 'dt'} for e in reversed(events)][:300]
+        _ledger_sync.update(ts=time.time(), ok=ok, unmatched=round(unmatched, 2),
+                            fills=len(_fill_cache['fills']),
+                            last_sync=datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d %I:%M %p'))
+        save_state()
     except Exception as e:
-        logger.error(f"record_realized failed for {symbol}: {e}")
+        logger.error(f"ledger sync failed: {e}")
+        _ledger_sync['ts'] = time.time() - max_age + 15
+        _ledger_sync['ok'] = False
+    finally:
+        _ledger_lock.release()
 
 # ---- Vault: the at-risk "Trading account" vs. profit set aside ----
 # Bookkeeping inside the app — no money moves at Alpaca. trading balance =
@@ -552,6 +702,7 @@ def vault_balance():
 def vault_trading_balance():
     """Start + all banked gains/losses - profit swept out + money moved back in.
     Taking money OUT of the vault deliberately doesn't change this."""
+    sync_ledger_from_fills()
     v, led = _vault(), _ledger()
     return round(v['trading_start'] + led['total'] - v['swept_total'] + v['moved_total'], 2)
 
@@ -590,6 +741,7 @@ def sweep_vault_if_due():
     """Idempotent: sweeps each completed trading day once. Today counts as
     complete after 4:05 PM ET."""
     try:
+        sync_ledger_from_fills()
         v, led = _vault(), _ledger()
         est = datetime.now(pytz.timezone('America/New_York'))
         today = est.strftime('%Y-%m-%d')
@@ -2083,6 +2235,12 @@ def profit_ledger():
         "realized_week": led['by_week'].get(wk, 0.0),
         "realized_total": led['total'],
         "tracking_since": led['since'],
+        "ledger_source": "alpaca_fills",
+        "ledger_last_sync": _ledger_sync['last_sync'],
+        "ledger_sync_ok": _ledger_sync['ok'],
+        "fills_loaded": _ledger_sync['fills'],
+        "unmatched_sell_shares": _ledger_sync['unmatched'],
+        "pl_basis": "today's 9:30 AM opening equity",
         "unrealized_open": unrealized,
         "open_positions": open_positions,
         "account_change_today": round(get_real_today_pl(), 2),

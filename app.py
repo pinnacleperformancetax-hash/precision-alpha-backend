@@ -61,6 +61,10 @@ MARKET_SCAN_LIST = ['AAPL','TSLA','NVDA','SPY','QQQ','MSFT','AMD','META','GOOGL'
 
 RULES = {
     'maxDailyLoss': 30, 'maxTrades': 999, 'maxPositionSize': 200,
+    # Per-stock daily loss: once ONE stock is down this many dollars today, the
+    # engine stops BUYING that stock until tomorrow and keeps trading the rest.
+    # The account-wide maxDailyLoss above stays the hard stop for everything.
+    'maxDailyLossPerStock': 15,
     # Stop-loss as a % below the average entry price, not flat dollars: a $9
     # stop was ~3% on a $300 stock but ~60% on a $15 one, so it protected
     # expensive stocks and barely existed for cheap ones.
@@ -158,7 +162,7 @@ RISK_PROFILES = {
         'label': 'Conservative',
         'description': 'Smaller positions, tighter stops, takes profit earlier, and needs more signals to agree before buying.',
         'rules': {
-            'maxDailyLoss': 20, 'maxSharesPerStock': 3, 'maxLossPct': 2.5,
+            'maxDailyLoss': 20, 'maxDailyLossPerStock': 10, 'maxSharesPerStock': 3, 'maxLossPct': 2.5,
             'minConfidence': 50, 'maxVolatility': 70, 'minSyncScore': 50,
             'scaleOutTier1Pct': 3, 'scaleOutTier2Pct': 6, 'scaleOutTier3Pct': 9,
             'takeProfitPct': 9,
@@ -169,7 +173,7 @@ RISK_PROFILES = {
         'label': 'Balanced',
         'description': 'The default. Moderate position sizes, stops, and profit targets.',
         'rules': {
-            'maxDailyLoss': 30, 'maxSharesPerStock': 5, 'maxLossPct': 4,
+            'maxDailyLoss': 30, 'maxDailyLossPerStock': 15, 'maxSharesPerStock': 5, 'maxLossPct': 4,
             'minConfidence': 30, 'maxVolatility': 90, 'minSyncScore': 30,
             'scaleOutTier1Pct': 5, 'scaleOutTier2Pct': 10, 'scaleOutTier3Pct': 15,
             'takeProfitPct': 15,
@@ -180,7 +184,7 @@ RISK_PROFILES = {
         'label': 'Aggressive',
         'description': 'Larger positions, wider stops, lets winners run further, and acts on fewer confirming signals. More trades, bigger swings both ways.',
         'rules': {
-            'maxDailyLoss': 60, 'maxSharesPerStock': 8, 'maxLossPct': 7,
+            'maxDailyLoss': 60, 'maxDailyLossPerStock': 30, 'maxSharesPerStock': 8, 'maxLossPct': 7,
             'minConfidence': 25, 'maxVolatility': 95, 'minSyncScore': 25,
             'scaleOutTier1Pct': 8, 'scaleOutTier2Pct': 16, 'scaleOutTier3Pct': 25,
             'takeProfitPct': 25,
@@ -556,8 +560,19 @@ LEDGER_SINCE = os.environ.get('LEDGER_SINCE', '2026-10-06')
 LEDGER_HISTORY_FROM = os.environ.get('LEDGER_HISTORY_FROM', '2026-08-01')
 _OCC_RE = re.compile(r'^[A-Z]{1,6}\d{6}[CP]\d{8}$')
 _fill_cache = {'fills': [], 'ids': set(), 'last_time': None}
-_ledger_sync = {'ts': 0.0, 'ok': None, 'unmatched': 0.0, 'fills': 0, 'last_sync': None}
+_ledger_sync = {'ts': 0.0, 'ok': None, 'unmatched': 0.0, 'fills': 0, 'last_sync': None,
+                'attempts': 0, 'skipped_busy': 0, 'error': None, 'booted': time.time()}
 _ledger_lock = threading.Lock()
+
+def _reset_ledger_lock():
+    """A forked worker can inherit this lock already 'taken' by a thread that
+    doesn't exist in the child, which would block every sync forever."""
+    global _ledger_lock
+    _ledger_lock = threading.Lock()
+try:
+    os.register_at_fork(after_in_child=_reset_ledger_lock)
+except Exception:
+    pass
 
 def _week_key_for(d):
     return f"{d.year}-W{d.isocalendar()[1]}"  # same format as get_week_key()
@@ -639,13 +654,19 @@ def sync_ledger_from_fills(max_age=60, force=False):
     sync is already running. A failed lookup keeps the last good ledger."""
     if not force and time.time() - _ledger_sync['ts'] < max_age:
         return
-    if not _ledger_lock.acquire(blocking=False):
+    lock = _ledger_lock  # keep this exact lock, even if ?sync=1 swaps in a new one meanwhile
+    if not lock.acquire(blocking=False):
+        _ledger_sync['skipped_busy'] += 1
+        logger.info("📒 Ledger sync skipped — another sync is running")
         return
+    _ledger_sync['attempts'] += 1
     try:
         ok = _fetch_new_fills()
         if not ok and not _fill_cache['fills']:
             _ledger_sync['ts'] = time.time() - max_age + 15  # retry in ~15s
             _ledger_sync['ok'] = False
+            _ledger_sync['error'] = "couldn't read fill history from Alpaca"
+            logger.error("📒 Ledger sync failed: couldn't read fill history from Alpaca")
             return
         events, unmatched = _compute_realized(_fill_cache['fills'])
         events = [e for e in events if e['date'] >= LEDGER_SINCE]
@@ -662,14 +683,18 @@ def sync_ledger_from_fills(max_age=60, force=False):
         led['entries'] = [{k: v for k, v in e.items() if k != 'dt'} for e in reversed(events)][:300]
         _ledger_sync.update(ts=time.time(), ok=ok, unmatched=round(unmatched, 2),
                             fills=len(_fill_cache['fills']),
-                            last_sync=datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d %I:%M %p'))
+                            last_sync=datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d %I:%M %p'),
+                            error=None)
+        logger.info(f"📒 Ledger synced: {len(_fill_cache['fills'])} fills, {len(events)} sells since {LEDGER_SINCE}, realized ${led['total']:.2f}")
         save_state()
     except Exception as e:
-        logger.error(f"ledger sync failed: {e}")
+        import traceback
+        logger.error(f"📒 Ledger sync failed: {e}\n{traceback.format_exc()}")
         _ledger_sync['ts'] = time.time() - max_age + 15
         _ledger_sync['ok'] = False
+        _ledger_sync['error'] = f"{type(e).__name__}: {e}"[:300]
     finally:
-        _ledger_lock.release()
+        lock.release()
 
 # ---- Vault: the at-risk "Trading account" vs. profit set aside ----
 # Bookkeeping inside the app — no money moves at Alpaca. trading balance =
@@ -797,6 +822,37 @@ def capital_cap_blocks(price):
     if invested + float(price) > balance:
         return f"${invested:,.0f} invested + ${float(price):,.2f} would exceed the ${balance:,.0f} trading balance"
     return None
+
+def stock_today_pl(symbol, held, price, day_open):
+    """How much one stock has made or lost TODAY, counting shares sold or bought
+    today. Same idea as the account-wide figure (value now minus value at the
+    9:30 open), just for one symbol:
+        (shares held now x price) + today's sale proceeds - today's buy cost
+        - (shares held at the open x today's opening price)
+    Returns None when today's open isn't known. Approximate by a few cents:
+    fills from the last minute may not be in the cache yet."""
+    if not day_open:
+        return None
+    try:
+        et = pytz.timezone('America/New_York')
+        today = datetime.now(et).strftime('%Y-%m-%d')
+        bought = sold = buy_cost = sale_proceeds = 0.0
+        for f in _fill_cache['fills']:
+            if f.get('symbol') != symbol:
+                continue
+            t = datetime.fromisoformat(f['transaction_time'].replace('Z', '+00:00')).astimezone(et)
+            if t.strftime('%Y-%m-%d') != today:
+                continue
+            q, p = float(f['qty']), float(f['price'])
+            if str(f.get('side', '')).lower() == 'buy':
+                bought += q; buy_cost += q * p
+            else:
+                sold += q; sale_proceeds += q * p
+        held_at_open = held - bought + sold
+        return held * price + sale_proceeds - buy_cost - held_at_open * float(day_open)
+    except Exception as e:
+        logger.warning(f"per-stock P&L failed for {symbol}: {e}")
+        return None
 
 def _sell_shares(symbol, qty, current_price, reason, unrealized_pl_for_log, avg_entry=None):
     """Places the actual sell order and records it. Shared by the stop-loss,
@@ -1285,9 +1341,13 @@ def auto_scan():
             start = (datetime.utcnow() - timedelta(days=3)).isoformat() + 'Z'
             br = requests.get(f"{ALPACA_DATA_URL}/stocks/{symbol}/bars?timeframe=1Day&start={start}&end={end}&limit=5", headers=alpaca_hdrs(), timeout=10)
             price_change = 0
+            day_open = None  # today's opening price, for the per-stock loss rule
             if br.ok:
                 bars = br.json().get('bars', [])
                 if len(bars) >= 2: price_change = bars[-1]['c'] - bars[-2]['c']
+                today_et = datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d')
+                if bars and str(bars[-1].get('t', ''))[:10] == today_et:
+                    day_open = bars[-1].get('o')
 
             try:
                 ai, vol_data, sentiment = quick_ai_check(symbol, price, price_change)
@@ -1349,6 +1409,15 @@ def auto_scan():
                 if current_qty >= r['maxSharesPerStock']:
                     log_scan(f"⏭ {symbol} — max {r['maxSharesPerStock']} shares held/pending, skipping{level_tag(symbol)}")
                     continue
+                # Per-stock daily loss: this ONE stock is down too much today,
+                # so no more buys of it until tomorrow. Other stocks carry on.
+                stock_limit = r.get('maxDailyLossPerStock') or 0
+                if stock_limit > 0:
+                    stock_pl = stock_today_pl(symbol, held, price, day_open)
+                    if stock_pl is not None and stock_pl <= -stock_limit:
+                        log_scan(f"🔻 {symbol} — down ${-stock_pl:.2f} today (per-stock limit ${stock_limit:.0f}), no more buys of it today{level_tag(symbol)}")
+                        log_customer(f"🔻 {symbol} — Paused for today. It's down ${-stock_pl:.2f} on its own, past your ${stock_limit:.0f} per-stock limit. Other stocks keep trading.")
+                        continue
 
             qty = 1  # Always buy 1 share at a time
             # A buy on a symbol already holding shares IS scaling in — it's
@@ -2213,6 +2282,9 @@ def ai_analyze():
 @app.route("/api/profit/ledger")
 def profit_ledger():
     """Banked (realized) profit kept separate from money still at risk."""
+    if request.args.get('sync'):
+        _reset_ledger_lock()  # ?sync=1: force a fresh sync, even if a lock is stuck
+        sync_ledger_from_fills(force=True)
     sweep_vault_if_due()
     led = _ledger()
     est = datetime.now(pytz.timezone('America/New_York'))
@@ -2238,6 +2310,11 @@ def profit_ledger():
         "ledger_source": "alpaca_fills",
         "ledger_last_sync": _ledger_sync['last_sync'],
         "ledger_sync_ok": _ledger_sync['ok'],
+        "ledger_debug": {"pid": os.getpid(), "lock_held": _ledger_lock.locked(),
+                         "attempts": _ledger_sync['attempts'], "skipped_busy": _ledger_sync['skipped_busy'],
+                         "error": _ledger_sync['error'],
+                         "seconds_since_boot": round(time.time() - _ledger_sync['booted']),
+                         "threads": threading.active_count()},
         "fills_loaded": _ledger_sync['fills'],
         "unmatched_sell_shares": _ledger_sync['unmatched'],
         "pl_basis": "today's 9:30 AM opening equity",
@@ -2365,7 +2442,7 @@ def get_settings():
 @require_api_key
 def update_settings():
     data = request.get_json()
-    allowed = ['maxDailyLoss','maxTrades','maxPositionSize','maxLossPct',
+    allowed = ['maxDailyLoss','maxDailyLossPerStock','maxTrades','maxPositionSize','maxLossPct',
                'takeProfitTarget','minConfidence','maxVolatility','minSyncScore',
                'maxSharesPerStock','takeProfitPct',
                'scaleOutTier1Pct','scaleOutTier1Frac','scaleOutTier2Pct','scaleOutTier2Frac','scaleOutTier3Pct']

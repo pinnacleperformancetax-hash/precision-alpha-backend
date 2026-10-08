@@ -58,7 +58,7 @@ def require_api_key(fn):
             logger.warning(f"⚠️ API_KEY not set — {request.path} is UNPROTECTED")
             return fn(*args, **kwargs)
         supplied = request.headers.get("X-API-Key", "")
-        if supplied != API_KEY:
+        if supplied != API_KEY and not _is_owner(current_user()):
             return jsonify({"error": "unauthorized"}), 401
         return fn(*args, **kwargs)
     return wrapper
@@ -246,6 +246,87 @@ def _remote_kick():
             if _remote['pid'] != os.getpid():
                 _remote['pid'] = os.getpid()
                 threading.Thread(target=_remote_writer, daemon=True).start()
+
+# ---- Login (Supabase email + password) ------------------------------------
+# The dashboard signs people in with Supabase and sends their access token on
+# every request. We verify that token with Supabase itself (no extra library),
+# and for now only the OWNER's account may see or control the engine. Anyone
+# else who signs up gets an account but no access to your trading data.
+#
+# REQUIRE_LOGIN=1 (Render environment) turns enforcement on for every /api/
+# route. It is OFF by default so nothing breaks until the login is proven.
+# The old X-API-Key keeps working as a second way in (scripts, emergencies).
+SUPABASE_PUBLISHABLE_KEY = os.environ.get("SUPABASE_PUBLISHABLE_KEY", "sb_publishable_AiHOWwrehmi2eTOX-OVwmg_llh_-oih").strip()
+OWNER_EMAIL = os.environ.get("OWNER_EMAIL", ALERT_EMAIL).strip().lower()
+REQUIRE_LOGIN = os.environ.get("REQUIRE_LOGIN", "").strip() == "1"
+_auth_cache = {}  # token -> (expires_at, user_dict_or_None)
+
+def _verify_token(token):
+    """Asks Supabase who this token belongs to. Cached briefly so the dashboard's
+    15-second polling doesn't turn into a Supabase call every time."""
+    if not token or not SUPABASE_URL:
+        return None
+    now = time.time()
+    hit = _auth_cache.get(token)
+    if hit and hit[0] > now:
+        return hit[1]
+    user = None
+    ttl = 30  # failures are remembered only briefly
+    try:
+        r = requests.get(f"{SUPABASE_URL}/auth/v1/user", timeout=8,
+                         headers={"apikey": SUPABASE_PUBLISHABLE_KEY, "Authorization": f"Bearer {token}"})
+        if r.ok:
+            user = r.json()
+            ttl = 300
+        elif r.status_code not in (401, 403):
+            logger.warning(f"login check: Supabase answered HTTP {r.status_code}")
+            ttl = 5
+    except Exception as e:
+        logger.warning(f"login check failed: {e}")
+        ttl = 5
+    if len(_auth_cache) > 500:
+        _auth_cache.clear()
+    _auth_cache[token] = (now + ttl, user)
+    return user
+
+def _bearer_token():
+    h = request.headers.get("Authorization", "")
+    return h[7:].strip() if h.lower().startswith("bearer ") else ""
+
+def current_user():
+    """The signed-in Supabase user for this request, or None."""
+    return _verify_token(_bearer_token())
+
+def _is_owner(user):
+    if not user:
+        return False
+    email = str(user.get("email") or "").strip().lower()
+    confirmed = bool(user.get("email_confirmed_at") or user.get("confirmed_at"))
+    return bool(email) and email == OWNER_EMAIL and confirmed
+
+def _has_valid_api_key():
+    return bool(API_KEY) and request.headers.get("X-API-Key", "") == API_KEY
+
+@app.before_request
+def _enforce_login():
+    if not REQUIRE_LOGIN:
+        return None
+    if request.method == "OPTIONS" or not request.path.startswith("/api/"):
+        return None
+    if request.path == "/api/auth/me":
+        return None  # answers for itself
+    if _has_valid_api_key() or _is_owner(current_user()):
+        return None
+    return jsonify({"error": "login required"}), 401
+
+@app.route("/api/auth/me")
+def auth_me():
+    """Who am I, and may I see the trading data? The dashboard calls this right after sign-in."""
+    user = current_user()
+    if not user:
+        return jsonify({"signed_in": False, "is_owner": False, "login_required": REQUIRE_LOGIN}), 401
+    return jsonify({"signed_in": True, "email": user.get("email"), "is_owner": _is_owner(user),
+                    "login_required": REQUIRE_LOGIN})
 
 def save_state():
     try:

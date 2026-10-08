@@ -17,7 +17,9 @@ app = Flask(__name__)
 # NOTE: CORS previously allowed "*" alongside the named Netlify origin, which
 # defeats the point of naming an origin at all (any site could call this API
 # from a browser). Restricted to just your frontend's real origin.
-CORS(app, origins=["https://precision-alpha-ai.netlify.app"])
+_ORIGINS = ["https://precision-alpha-ai.netlify.app", "https://precisionalphaai.com", "https://www.precisionalphaai.com"]
+_ORIGINS += [o.strip() for o in os.environ.get("EXTRA_ORIGINS", "").split(",") if o.strip()]
+CORS(app, origins=_ORIGINS)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

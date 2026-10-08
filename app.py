@@ -823,7 +823,7 @@ LEDGER_SINCE = os.environ.get('LEDGER_SINCE', '2026-10-06')
 LEDGER_HISTORY_FROM = os.environ.get('LEDGER_HISTORY_FROM', '2026-08-01')
 _OCC_RE = re.compile(r'^[A-Z]{1,6}\d{6}[CP]\d{8}$')
 _fill_cache = {'fills': [], 'ids': set(), 'last_time': None}
-_ledger_sync = {'ts': 0.0, 'ok': None, 'unmatched': 0.0, 'fills': 0, 'last_sync': None,
+_ledger_sync = {'ts': 0.0, 'ok': None, 'unmatched': 0.0, 'unmatched_rows': [], 'first_fill': None, 'fills': 0, 'last_sync': None,
                 'attempts': 0, 'skipped_busy': 0, 'error': None, 'booted': time.time()}
 _ledger_lock = threading.Lock()
 
@@ -867,11 +867,12 @@ def _fetch_new_fills():
     return True
 
 def _compute_realized(fills):
-    """FIFO-match sells against earlier buys. Returns (events, unmatched_shares).
-    One event per closing fill, with a share-weighted entry price."""
+    """FIFO-match sells against earlier buys. Returns (events, unmatched_shares, unmatched_rows).
+    One event per closing fill, with a share-weighted entry price. unmatched_rows lists
+    each sell (or part of a sell) that had no earlier buy in the loaded history."""
     from collections import deque
     et = pytz.timezone('America/New_York')
-    lots, events, unmatched = {}, [], 0.0
+    lots, events, unmatched, unmatched_rows = {}, [], 0.0, []
     for f in sorted(fills, key=lambda x: x.get('transaction_time') or ''):
         try:
             sym, q, p = f['symbol'], float(f['qty']), float(f['price'])
@@ -909,7 +910,9 @@ def _compute_realized(fills):
                 dq.append([-remaining, p])
             else:
                 unmatched += remaining  # a sell whose buy is older than the history window
-    return events, unmatched
+                unmatched_rows.append({'date': t.strftime('%Y-%m-%d'), 'time': t.strftime('%I:%M %p'),
+                                       'symbol': sym, 'shares': round(remaining, 2), 'price': round(p, 2)})
+    return events, unmatched, unmatched_rows
 
 def sync_ledger_from_fills(max_age=60, force=False):
     """Rebuild the profit ledger from Alpaca's fill history (cached, incremental).
@@ -931,7 +934,7 @@ def sync_ledger_from_fills(max_age=60, force=False):
             _ledger_sync['error'] = "couldn't read fill history from Alpaca"
             logger.error("📒 Ledger sync failed: couldn't read fill history from Alpaca")
             return
-        events, unmatched = _compute_realized(_fill_cache['fills'])
+        events, unmatched, unmatched_rows = _compute_realized(_fill_cache['fills'])
         events = [e for e in events if e['date'] >= LEDGER_SINCE]
         led = _ledger()
         by_day, by_week = {}, {}
@@ -944,7 +947,9 @@ def sync_ledger_from_fills(max_age=60, force=False):
         led['by_week'] = dict(list(by_week.items())[-12:])
         led['since'] = LEDGER_SINCE
         led['entries'] = [{k: v for k, v in e.items() if k != 'dt'} for e in reversed(events)][:300]
+        _times = [f.get('transaction_time') for f in _fill_cache['fills'] if f.get('transaction_time')]
         _ledger_sync.update(ts=time.time(), ok=ok, unmatched=round(unmatched, 2),
+                            unmatched_rows=unmatched_rows[-60:], first_fill=(min(_times) if _times else None),
                             fills=len(_fill_cache['fills']),
                             last_sync=datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d %I:%M %p'),
                             error=None)
@@ -2071,6 +2076,20 @@ def congress_scan():
         save_state()
         return
 
+    # Same daily loss limit the Auto Engine obeys: if the account is down by the
+    # limit today, no new congressional buys. last_scan is NOT set, so if the
+    # account recovers later today the scan still runs. (Selling/stop-losses are
+    # handled by the Auto Engine and are never blocked.)
+    try:
+        _pl = get_real_today_pl()
+    except Exception:
+        _pl = 0.0
+    if _pl <= -RULES['maxDailyLoss']:
+        if congress_state.get('loss_logged_day') != today:
+            congress_state['loss_logged_day'] = today
+            log_congress(f"🔴 Daily loss limit hit (P&L: ${_pl:.2f}, limit ${RULES['maxDailyLoss']:.0f}) — no congressional buys while the account is down this much")
+        return
+
     log_congress("🏛️ Polling all congressional data sources in parallel...")
     trades = get_congress_trades()
 
@@ -2093,6 +2112,15 @@ def congress_scan():
             continue
 
         if bought >= 3:
+            break
+
+        # Re-check the daily loss limit between buys: a few buys can land while P&L moves.
+        try:
+            _pl_now = cached_real_today_pl()
+        except Exception:
+            _pl_now = 0.0
+        if _pl_now <= -RULES['maxDailyLoss']:
+            log_congress(f"🔴 Daily loss limit hit mid-scan (P&L: ${_pl_now:.2f}) — stopping congressional buys")
             break
 
         # Also stop mid-scan if this batch of buys pushes past the weekly limit.
@@ -2738,6 +2766,8 @@ def profit_ledger():
                          "threads": threading.active_count()},
         "fills_loaded": _ledger_sync['fills'],
         "unmatched_sell_shares": _ledger_sync['unmatched'],
+        "unmatched_sells": _ledger_sync['unmatched_rows'],
+        "history_window": {"history_from": LEDGER_HISTORY_FROM, "earliest_fill_loaded": _ledger_sync['first_fill']},
         "pl_basis": "today's 9:30 AM opening equity",
         "unrealized_open": unrealized,
         "open_positions": open_positions,

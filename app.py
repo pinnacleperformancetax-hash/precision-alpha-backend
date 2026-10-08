@@ -1149,6 +1149,38 @@ def check_and_sell_positions():
     except Exception as e:
         logger.error(f"Auto-sell error: {e}")
 
+# ---- AI health: tell the dashboard when the Anthropic API stops answering ----
+# (e.g. credits ran out). Without this the engine silently stops reading
+# signals and the only clue is the Render logs.
+ai_health = {'fails': 0, 'kind': '', 'message': '', 'since': '', 'last_ok': ''}
+
+def note_ai_ok():
+    if ai_health['fails'] >= 3:
+        log_scan("✅ AI responses are working again")
+    ai_health['fails'] = 0
+    ai_health['kind'] = ''
+    ai_health['message'] = ''
+    ai_health['since'] = ''
+    ai_health['last_ok'] = datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d %H:%M:%S')
+
+def note_ai_failure(status, text):
+    low = (text or '').lower()
+    if 'credit balance' in low:
+        kind, msg = 'billing', "Anthropic API credits ran out. Add credits at console.anthropic.com (Billing). Until then the engine can't score new buys or sells; stop-losses still work."
+    elif status == 401:
+        kind, msg = 'key', "Anthropic rejected the API key. Check ANTHROPIC_API_KEY in Render. Until fixed the engine can't score new buys or sells; stop-losses still work."
+    elif status == 429:
+        kind, msg = 'rate', "Anthropic is rate-limiting the engine. New buy/sell scoring may be slow or skipped."
+    else:
+        kind, msg = 'other', f"The AI service returned an error (HTTP {status}). New buy/sell scoring may be skipped."
+    if ai_health['fails'] == 0:
+        ai_health['since'] = datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d %H:%M:%S')
+    ai_health['fails'] += 1
+    ai_health['kind'] = kind
+    ai_health['message'] = msg
+    if ai_health['fails'] == 3:
+        log_scan(f"⚠️ AI problem: {msg}")
+
 def get_sentiment(symbol):
     """Get sentiment score from recent news headlines using AI"""
     try:
@@ -1185,6 +1217,7 @@ Where "sentiment" is one of: bullish, bearish, neutral. "score" is a number from
             timeout=15)
         if not res.ok:
             logger.error(f"Sentiment API error for {symbol}: HTTP {res.status_code} — {res.text[:300]}")
+            note_ai_failure(res.status_code, res.text)
             return None
         body = res.json()
         if 'content' not in body:
@@ -1300,6 +1333,7 @@ Be very aggressive. confidence>30, volatility<90, sync>30 required."""
         timeout=20)
     if not res.ok:
         logger.error(f"AI check API error for {symbol}: HTTP {res.status_code} — {res.text[:300]}")
+        note_ai_failure(res.status_code, res.text)
         raise ValueError(f"AI check failed: HTTP {res.status_code}")
     body = res.json()
     if 'content' not in body:
@@ -1307,7 +1341,8 @@ Be very aggressive. confidence>30, volatility<90, sync>30 required."""
         raise ValueError("AI check returned no content")
     text = body['content'][0]['text'].replace('```json','').replace('```','').strip()
     result = json.loads(text)
-    
+    note_ai_ok()
+
     # Volume boost: if volume is 2x+ average and momentum is positive, boost confidence
     if vol_data and vol_data['volume_ratio'] >= 2.0 and vol_data['momentum_5d'] > 0:
         original_conf = result.get('confidence', 0)
@@ -2053,6 +2088,9 @@ def engine_status():
         "trade_log": engine_state['trade_log'][:20],
         "customer_feed": engine_state['customer_feed'][:30],
         "is_market_hours": is_market_hours(),
+        "ai_health": {"ok": ai_health['fails'] < 3, "kind": ai_health['kind'],
+                      "message": ai_health['message'], "since": ai_health['since'],
+                      "last_ok": ai_health['last_ok']},
     })
 
 @app.route("/api/congress/status")

@@ -36,6 +36,9 @@ ALPACA_OPTIONS_DATA_URL = "https://data.alpaca.markets/v1beta1"
 EMAILJS_SERVICE   = os.environ.get("EMAILJS_SERVICE", "service_rucosmz")
 EMAILJS_TEMPLATE  = os.environ.get("EMAILJS_TEMPLATE", "template_qajvk5t")
 EMAILJS_PUBLIC    = os.environ.get("EMAILJS_PUBLIC", "i9a72iQL0ChaDHoZL")
+# Private key: required when EmailJS "strict mode" is on for server-side sends.
+# Set EMAILJS_PRIVATE in Render (never put the key in the code).
+EMAILJS_PRIVATE   = os.environ.get("EMAILJS_PRIVATE", "")
 ALERT_EMAIL       = os.environ.get("ALERT_EMAIL", "pinnacleperformancetax@gmail.com")
 
 # Shared secret for state-changing routes (placing orders, starting/stopping
@@ -597,10 +600,15 @@ def send_email(subject, body_text, template_params_override=None):
         }
         if template_params_override:
             params.update(template_params_override)
-        res = requests.post("https://api.emailjs.com/api/v1.0/email/send", json={
+        payload = {
             "service_id": EMAILJS_SERVICE, "template_id": EMAILJS_TEMPLATE, "user_id": EMAILJS_PUBLIC,
             "template_params": params
-        }, timeout=10)
+        }
+        if EMAILJS_PRIVATE:
+            payload["accessToken"] = EMAILJS_PRIVATE
+        else:
+            logger.warning("EMAILJS_PRIVATE is not set - EmailJS strict mode will reject server-side emails")
+        res = requests.post("https://api.emailjs.com/api/v1.0/email/send", json=payload, timeout=10)
         if not res.ok:
             logger.error(f"Email failed: HTTP {res.status_code} — {res.text[:300]}")
             return False, f"HTTP {res.status_code} — {res.text[:300]}"

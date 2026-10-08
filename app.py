@@ -647,6 +647,36 @@ def send_trade_alert(symbol, side, qty, price, reason, verdict, test=False):
     prefix = "TEST - " if test else ""
     return send_email(f"🤖 Precision Alpha: {prefix}{verdict} — {side.upper()} {qty} {symbol}", reason, params)
 
+def _week_fills_summary():
+    """This week's FILLED orders straight from Alpaca (Monday 00:00 ET onward), so the
+    weekly email matches the dashboard. The old internal list missed scale-outs and
+    stop-loss sells. Returns (buys, sells, per_symbol, capped) or None on failure."""
+    try:
+        est = datetime.now(pytz.timezone('America/New_York'))
+        monday = (est - timedelta(days=est.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        after = monday.astimezone(pytz.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        r = requests.get(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(), timeout=15,
+                         params={"status": "closed", "after": after, "limit": 500, "direction": "desc"})
+        if not r.ok:
+            return None
+        orders = r.json()
+        buys = sells = 0
+        per = {}
+        for o in orders:
+            if o.get('status') != 'filled':
+                continue
+            sym = o.get('symbol', '?')
+            qty = int(float(o.get('filled_qty') or o.get('qty') or 0))
+            d = per.setdefault(sym, {'buy': 0, 'sell': 0})
+            if o.get('side') == 'buy':
+                buys += 1; d['buy'] += qty
+            else:
+                sells += 1; d['sell'] += qty
+        return buys, sells, per, len(orders) >= 500
+    except Exception as e:
+        logger.error(f"week fills summary failed: {e}")
+        return None
+
 def build_weekly_params():
     """Everything the weekly-summary template needs, as separate fields."""
     est = datetime.now(pytz.timezone('America/New_York'))
@@ -655,6 +685,9 @@ def build_weekly_params():
     trades = engine_state.get('weekly_trades', [])
     buys = len([t for t in trades if t.get('side', 'buy') == 'buy'])
     sells = len(trades) - buys
+    wf = _week_fills_summary()
+    if wf:
+        buys, sells = wf[0], wf[1]
     try:
         today_pl = get_real_today_pl()
     except Exception:
@@ -665,7 +698,7 @@ def build_weekly_params():
         "banked_week": _usd(banked_week),
         "banked_since": _usd(led.get('total', 0.0)),
         "today_pl": _usd(today_pl),
-        "trades_total": str(len(trades)),
+        "trades_total": str(buys + sells),
         "trades_buys": str(buys),
         "trades_sells": str(sells),
         "summary_text": build_weekly_summary_text(),
@@ -700,6 +733,18 @@ def email_test():
 
 def build_weekly_summary_text():
     """Compose the Saturday weekly digest from this week's trades."""
+    wf = _week_fills_summary()
+    if wf:
+        buys, sells, per, capped = wf
+        lines = [f"Filled orders this week: {buys + sells}" + (" (500+, list capped)" if capped else "") +
+                 f" — {buys} buys, {sells} sells\n", "By stock (shares bought / shares sold):"]
+        for sym in sorted(per, key=lambda k: -(per[k]['buy'] + per[k]['sell'])):
+            lines.append(f"  • {sym}: bought {per[sym]['buy']}, sold {per[sym]['sell']}")
+        try:
+            lines.append(f"\nToday's P&L: {_usd(get_real_today_pl())}")
+        except Exception:
+            pass
+        return "\n".join(lines)
     trades = engine_state.get('weekly_trades', [])
     if not trades:
         return "No trades were placed this week."

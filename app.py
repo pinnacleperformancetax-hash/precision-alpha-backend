@@ -603,10 +603,22 @@ def send_email(subject, body_text, template_params_override=None):
         }, timeout=10)
         if not res.ok:
             logger.error(f"Email failed: HTTP {res.status_code} — {res.text[:300]}")
-        else:
-            logger.info("✉️ Email sent successfully")
+            return False, f"HTTP {res.status_code} — {res.text[:300]}"
+        logger.info("✉️ Email sent successfully")
+        return True, f"EmailJS accepted it (sent to {ALERT_EMAIL})"
     except Exception as e:
         logger.error(f"Email failed: {e}")
+        return False, str(e)
+
+@app.route("/api/email/test", methods=["POST"])
+@require_api_key
+def email_test():
+    """Send a test email and report EmailJS's real answer."""
+    est = datetime.now(pytz.timezone('America/New_York'))
+    ok, detail = send_email(f"✉️ Precision Alpha test email — {est.strftime('%Y-%m-%d %I:%M %p')} ET",
+                            "This is a test from your Precision Alpha dashboard. If you can read this, email alerts work.")
+    return jsonify({"ok": ok, "detail": detail, "to": ALERT_EMAIL,
+                    "service": EMAILJS_SERVICE, "template": EMAILJS_TEMPLATE})
 
 def build_weekly_summary_text():
     """Compose the Saturday weekly digest from this week's trades."""

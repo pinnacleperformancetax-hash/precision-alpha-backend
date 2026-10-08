@@ -39,6 +39,9 @@ EMAILJS_PUBLIC    = os.environ.get("EMAILJS_PUBLIC", "i9a72iQL0ChaDHoZL")
 # Private key: required when EmailJS "strict mode" is on for server-side sends.
 # Set EMAILJS_PRIVATE in Render (never put the key in the code).
 EMAILJS_PRIVATE   = os.environ.get("EMAILJS_PRIVATE", "")
+# Separate EmailJS template for the Saturday weekly summary. If this isn't set
+# the summary falls back to the trade-alert template (message in the Reason row).
+EMAILJS_WEEKLY_TEMPLATE = os.environ.get("EMAILJS_WEEKLY_TEMPLATE", "")
 ALERT_EMAIL       = os.environ.get("ALERT_EMAIL", "pinnacleperformancetax@gmail.com")
 
 # Shared secret for state-changing routes (placing orders, starting/stopping
@@ -585,7 +588,7 @@ def log_congress(msg):
     congress_state['scan_log'] = congress_state['scan_log'][:50]
     logger.info(f"[CONGRESS] {msg}")
 
-def send_email(subject, body_text, template_params_override=None):
+def send_email(subject, body_text, template_params_override=None, template_id=None):
     """Generic email sender via EmailJS. Logs the real response on failure —
     previously this fired the request and never checked whether EmailJS
     actually accepted it, so a rejection (very common for server-side calls:
@@ -601,7 +604,7 @@ def send_email(subject, body_text, template_params_override=None):
         if template_params_override:
             params.update(template_params_override)
         payload = {
-            "service_id": EMAILJS_SERVICE, "template_id": EMAILJS_TEMPLATE, "user_id": EMAILJS_PUBLIC,
+            "service_id": EMAILJS_SERVICE, "template_id": (template_id or EMAILJS_TEMPLATE), "user_id": EMAILJS_PUBLIC,
             "template_params": params
         }
         if EMAILJS_PRIVATE:
@@ -618,15 +621,82 @@ def send_email(subject, body_text, template_params_override=None):
         logger.error(f"Email failed: {e}")
         return False, str(e)
 
+def _usd(x):
+    x = float(x or 0)
+    return f"-${abs(x):,.2f}" if x < 0 else f"${x:,.2f}"
+
+def send_trade_alert(symbol, side, qty, price, reason, verdict, test=False):
+    """Fills in every row of the Trade Alert card. Only used for rare, important
+    events (stop-loss exits) so it can't burn through EmailJS's monthly limit."""
+    est = datetime.now(pytz.timezone('America/New_York'))
+    price = float(price or 0)
+    qty = int(qty or 0)
+    r = RULES
+    params = {
+        "trade_symbol": symbol,
+        "trade_side": side.upper(),
+        "trade_qty": str(qty),
+        "trade_price": f"${price:,.2f}",
+        "trade_total": f"${price * qty:,.2f}",
+        "trade_reason": reason,
+        "trade_verdict": verdict,
+        "trade_time": est.strftime('%Y-%m-%d %I:%M %p') + " ET",
+        "stop_loss": f"${price * (1 - r['maxLossPct'] / 100):,.2f}" if price else "",
+        "take_profit": f"${price * (1 + r['scaleOutTier3Pct'] / 100):,.2f}" if price else "",
+    }
+    prefix = "TEST - " if test else ""
+    return send_email(f"🤖 Precision Alpha: {prefix}{verdict} — {side.upper()} {qty} {symbol}", reason, params)
+
+def build_weekly_params():
+    """Everything the weekly-summary template needs, as separate fields."""
+    est = datetime.now(pytz.timezone('America/New_York'))
+    led = _ledger()
+    wk = get_week_key()
+    trades = engine_state.get('weekly_trades', [])
+    buys = len([t for t in trades if t.get('side', 'buy') == 'buy'])
+    sells = len(trades) - buys
+    try:
+        today_pl = get_real_today_pl()
+    except Exception:
+        today_pl = 0.0
+    banked_week = led['by_week'].get(wk, 0.0)
+    return {
+        "week_label": f"Week ending {est.strftime('%b %d, %Y')}",
+        "banked_week": _usd(banked_week),
+        "banked_since": _usd(led.get('total', 0.0)),
+        "today_pl": _usd(today_pl),
+        "trades_total": str(len(trades)),
+        "trades_buys": str(buys),
+        "trades_sells": str(sells),
+        "summary_text": build_weekly_summary_text(),
+    }
+
+def send_weekly_email(test=False):
+    est = datetime.now(pytz.timezone('America/New_York'))
+    wp = build_weekly_params()
+    prefix = "TEST - " if test else ""
+    subject = f"📊 Precision Alpha: {prefix}Weekly Trading Summary — {est.strftime('%Y-%m-%d')}"
+    # If there is no weekly template yet, the full text goes in the trade card's Reason row.
+    return send_email(subject, wp["summary_text"], wp, template_id=(EMAILJS_WEEKLY_TEMPLATE or None))
+
 @app.route("/api/email/test", methods=["POST"])
 @require_api_key
 def email_test():
-    """Send a test email and report EmailJS's real answer."""
+    """Send a test email (kind = trade | weekly | plain) and report EmailJS's real answer."""
+    kind = ((request.get_json(silent=True) or {}).get("kind") or "plain").lower()
     est = datetime.now(pytz.timezone('America/New_York'))
-    ok, detail = send_email(f"✉️ Precision Alpha test email — {est.strftime('%Y-%m-%d %I:%M %p')} ET",
-                            "This is a test from your Precision Alpha dashboard. If you can read this, email alerts work.")
-    return jsonify({"ok": ok, "detail": detail, "to": ALERT_EMAIL,
-                    "service": EMAILJS_SERVICE, "template": EMAILJS_TEMPLATE})
+    template = EMAILJS_TEMPLATE
+    if kind == "trade":
+        ok, detail = send_trade_alert("AAPL", "sell", 5, 336.49,
+            "TEST: stop-loss example. This is what a real stop-loss alert looks like.", "STOP-LOSS", test=True)
+    elif kind == "weekly":
+        template = EMAILJS_WEEKLY_TEMPLATE or EMAILJS_TEMPLATE
+        ok, detail = send_weekly_email(test=True)
+    else:
+        ok, detail = send_email(f"✉️ Precision Alpha test email — {est.strftime('%Y-%m-%d %I:%M %p')} ET",
+                                "This is a test from your Precision Alpha dashboard. If you can read this, email alerts work.")
+    return jsonify({"ok": ok, "detail": detail, "to": ALERT_EMAIL, "kind": kind,
+                    "service": EMAILJS_SERVICE, "template": template})
 
 def build_weekly_summary_text():
     """Compose the Saturday weekly digest from this week's trades."""
@@ -642,9 +712,9 @@ def build_weekly_summary_text():
         lines.append(f"\n{src.upper()} ({len(items)} trade(s)):")
         for t in items:
             price = t.get('price', 0) or 0
-            lines.append(f"  • BUY {t.get('qty')} {t.get('symbol')}" + (f" @ ${price:.2f}" if price else ""))
+            lines.append(f"  • {str(t.get('side', 'buy')).upper()} {t.get('qty')} {t.get('symbol')}" + (f" @ ${price:.2f}" if price else ""))
     real_pl = get_real_today_pl()
-    lines.append(f"\nToday's P&L: ${real_pl:.2f}")
+    lines.append(f"\nToday's P&L: {_usd(real_pl)}")
     return "\n".join(lines)
 
 def check_and_send_weekly_email():
@@ -657,8 +727,10 @@ def check_and_send_weekly_email():
     wk = get_week_key()
     if engine_state.get('last_weekly_email_week') == wk:
         return  # already sent this week
-    summary = build_weekly_summary_text()
-    send_email(f"📊 Precision Alpha: Weekly Trading Summary — {est.strftime('%Y-%m-%d')}", summary)
+    ok, detail = send_weekly_email()
+    if not ok:
+        log_scan(f"⚠️ Weekly summary email failed: {detail[:120]}")
+        return  # leave unmarked so the next check retries
     engine_state['last_weekly_email_week'] = wk
     save_state()
     log_scan("✉️ Weekly summary email sent")
@@ -1075,6 +1147,10 @@ def _sell_shares(symbol, qty, current_price, reason, unrealized_pl_for_log, avg_
         if avg_entry:
             record_realized(symbol, qty, avg_entry, current_price, reason, 'engine')
         save_state()
+        if 'stop loss' in str(reason).lower():
+            threading.Thread(target=send_trade_alert,
+                             args=(symbol, 'sell', qty, current_price, f"Auto-sold at your loss limit. {reason}", 'STOP-LOSS'),
+                             daemon=True).start()
         return True
     else:
         log_scan(f"❌ Failed to sell {symbol}")

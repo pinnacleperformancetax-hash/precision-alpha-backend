@@ -3642,6 +3642,52 @@ def customer_engine_loop():
             logger.error(f"customer engine error: {customer_engine['last_error']}")
         time.sleep(300)
 
+def _cust_overview(uid, token):
+    """A customer's own paper account at a glance (read-only). Returns a dict, or None if Alpaca can't be reached."""
+    H = _cust_hdrs(token)
+    ar = requests.get(f"{CUST_ALPACA_BASE}/account", headers=H, timeout=10)
+    if ar.status_code in (401, 403):
+        return {"token_invalid": True}
+    pr = requests.get(f"{CUST_ALPACA_BASE}/positions", headers=H, timeout=10)
+    if not ar.ok or not pr.ok:
+        return None
+    a = ar.json()
+    equity, last = float(a.get("equity", 0) or 0), float(a.get("last_equity", 0) or 0)
+    pos = []
+    for p in pr.json():
+        try:
+            pos.append({"symbol": p["symbol"], "qty": float(p["qty"]), "entry": round(float(p["avg_entry_price"]), 2),
+                        "price": round(float(p["current_price"]), 2), "pl": round(float(p.get("unrealized_pl", 0) or 0), 2)})
+        except Exception:
+            continue
+    return {"equity": round(equity, 2), "day_pl": round(equity - last, 2) if last > 0 else 0.0,
+            "buying_power": round(float(a.get("buying_power", 0) or 0), 2), "positions": pos}
+
+@app.route("/api/me/overview")
+def my_overview():
+    u = _confirmed_user()
+    if not u:
+        return jsonify({"error": "login required"}), 401
+    try:
+        token = get_user_alpaca_token(u["id"])
+    except Exception:
+        token = None
+    if not token:
+        return jsonify({"error": "not connected"}), 409
+    try:
+        ov = _cust_overview(u["id"], token)
+    except Exception:
+        ov = None
+    if ov is None:
+        return jsonify({"error": "Alpaca is not answering right now"}), 502
+    if ov.get("token_invalid"):
+        _cust_revoke(u["id"])
+        return jsonify({"error": "Alpaca no longer allows access. Please reconnect."}), 409
+    st = _cust_state_load(u["id"])
+    ov["feed"] = (st.get("feed") or [])[:20]
+    ov["last_scan"] = st.get("last_scan")
+    return jsonify(ov)
+
 @app.route("/api/me/engine")
 def my_engine_status():
     u = _confirmed_user()

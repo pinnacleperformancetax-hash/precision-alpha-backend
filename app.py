@@ -315,7 +315,7 @@ def _enforce_login():
         return None
     if request.method == "OPTIONS" or not request.path.startswith("/api/"):
         return None
-    if request.path == "/api/auth/me" or request.path.startswith("/api/alpaca/"):
+    if request.path == "/api/auth/me" or request.path.startswith("/api/alpaca/") or request.path.startswith("/api/me/"):
         return None  # these routes check the caller themselves (customers are not owners)
     if _has_valid_api_key() or _is_owner(current_user()):
         return None
@@ -343,6 +343,9 @@ ALPACA_REDIRECT_URI = os.environ.get("ALPACA_REDIRECT_URI", "https://api.precisi
 ALPACA_OAUTH_ENV = os.environ.get("ALPACA_OAUTH_ENV", "paper").strip() or "paper"   # paper only until real-money is approved
 TOKEN_ENC_KEY = os.environ.get("TOKEN_ENC_KEY", "").strip()
 APP_URL = os.environ.get("APP_URL", "https://precisionalphaai.com").strip().rstrip("/")
+# Master switch for trading on customers' accounts. Stays OFF (customers can save settings but
+# cannot turn trading on) until you set CUSTOMER_ENGINE=1 in Render after legal review.
+CUSTOMER_ENGINE_ENABLED = os.environ.get("CUSTOMER_ENGINE", "").strip() == "1"
 ALPACA_AUTHORIZE_URL = "https://app.alpaca.markets/oauth/authorize"
 ALPACA_TOKEN_URL = "https://api.alpaca.markets/oauth/token"
 ALPACA_PAPER_ACCOUNT_URL = "https://paper-api.alpaca.markets/v2/account"
@@ -424,7 +427,9 @@ def alpaca_status():
     u = _confirmed_user()
     if not u:
         return jsonify({"error": "login required"}), 401
-    out = {"configured": _alpaca_connect_ready(), "connected": False, "env": ALPACA_OAUTH_ENV}
+    out = {"configured": _alpaca_connect_ready(), "connected": False, "env": ALPACA_OAUTH_ENV,
+           "customer_engine": CUSTOMER_ENGINE_ENABLED,
+           "risk_options": {k: {"label": v["label"], "description": v["description"]} for k, v in RISK_PROFILES.items()}}
     if out["configured"]:
         try:
             rows = _sb_rows("alpaca_connections", {"user_id": f"eq.{u['id']}", "select": "env,connected_at,revoked_at,token_encrypted"})
@@ -487,6 +492,45 @@ def alpaca_callback():
     except Exception as e:
         logger.error(f"Alpaca callback failed: {type(e).__name__}: {e}")
         return back("error")
+
+@app.route("/api/me/settings", methods=["POST"])
+def my_settings_save():
+    """A customer saves THEIR OWN risk level and trading on/off switch. Turning trading on
+    needs: the master switch (CUSTOMER_ENGINE=1), a connected paper account, and nothing else."""
+    u = _confirmed_user()
+    if not u:
+        return jsonify({"error": "login required"}), 401
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        return jsonify({"error": "not configured"}), 503
+    body = request.get_json(silent=True) or {}
+    row = {"user_id": u["id"], "updated_at": datetime.utcnow().isoformat() + "Z"}
+    if "risk_level" in body:
+        if body["risk_level"] not in RISK_PROFILES:
+            return jsonify({"error": "unknown risk level"}), 400
+        row["risk_level"] = body["risk_level"]
+    if "engine_enabled" in body:
+        want = body["engine_enabled"]
+        if not isinstance(want, bool):
+            return jsonify({"error": "engine_enabled must be true or false"}), 400
+        if want:
+            if not CUSTOMER_ENGINE_ENABLED:
+                return jsonify({"error": "not available yet", "message": "Trading for customer accounts is not switched on yet. Your other settings were not changed."}), 409
+            try:
+                connected = bool(get_user_alpaca_token(u["id"]))
+            except Exception:
+                connected = False
+            if not connected:
+                return jsonify({"error": "not connected", "message": "Connect your Alpaca account first."}), 409
+        row["engine_enabled"] = want
+    if len(row) == 2:
+        return jsonify({"error": "nothing to save"}), 400
+    try:
+        _sb_upsert("user_settings", row)
+    except Exception as e:
+        logger.error(f"saving customer settings failed: {e}")
+        return jsonify({"error": "could not save, try again"}), 500
+    return jsonify({"ok": True, "saved": {k: v for k, v in row.items() if k not in ("user_id", "updated_at")}})
+
 
 @app.route("/api/alpaca/disconnect", methods=["POST"])
 def alpaca_disconnect():

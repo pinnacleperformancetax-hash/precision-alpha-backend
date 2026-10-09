@@ -315,8 +315,8 @@ def _enforce_login():
         return None
     if request.method == "OPTIONS" or not request.path.startswith("/api/"):
         return None
-    if request.path == "/api/auth/me":
-        return None  # answers for itself
+    if request.path == "/api/auth/me" or request.path.startswith("/api/alpaca/"):
+        return None  # these routes check the caller themselves (customers are not owners)
     if _has_valid_api_key() or _is_owner(current_user()):
         return None
     return jsonify({"error": "login required"}), 401
@@ -329,6 +329,179 @@ def auth_me():
         return jsonify({"signed_in": False, "is_owner": False, "login_required": REQUIRE_LOGIN}), 401
     return jsonify({"signed_in": True, "email": user.get("email"), "is_owner": _is_owner(user),
                     "login_required": REQUIRE_LOGIN})
+
+# ---- Customers: connect their own Alpaca account ("Connect with Alpaca") ----
+# Any confirmed, signed-in user may connect THEIR OWN Alpaca account. This does NOT
+# give customers access to your dashboard or your engine (those stay owner-only).
+# The Alpaca token is encrypted with TOKEN_ENC_KEY before it is stored in Supabase and
+# is never sent back to the browser. Until ALPACA_CLIENT_ID / ALPACA_CLIENT_SECRET /
+# TOKEN_ENC_KEY are set (and Alpaca has approved the app) these routes answer
+# "not configured" and nothing else changes.
+ALPACA_CLIENT_ID = os.environ.get("ALPACA_CLIENT_ID", "").strip()
+ALPACA_CLIENT_SECRET = os.environ.get("ALPACA_CLIENT_SECRET", "").strip()
+ALPACA_REDIRECT_URI = os.environ.get("ALPACA_REDIRECT_URI", "https://api.precisionalphaai.com/api/alpaca/callback").strip()
+ALPACA_OAUTH_ENV = os.environ.get("ALPACA_OAUTH_ENV", "paper").strip() or "paper"   # paper only until real-money is approved
+TOKEN_ENC_KEY = os.environ.get("TOKEN_ENC_KEY", "").strip()
+APP_URL = os.environ.get("APP_URL", "https://precisionalphaai.com").strip().rstrip("/")
+ALPACA_AUTHORIZE_URL = "https://app.alpaca.markets/oauth/authorize"
+ALPACA_TOKEN_URL = "https://api.alpaca.markets/oauth/token"
+ALPACA_PAPER_ACCOUNT_URL = "https://paper-api.alpaca.markets/v2/account"
+ALPACA_LIVE_ACCOUNT_URL = "https://api.alpaca.markets/v2/account"
+
+def _fernet():
+    """Encryption helper, or None if the library or key isn't set up yet."""
+    if not TOKEN_ENC_KEY:
+        return None
+    try:
+        from cryptography.fernet import Fernet
+        return Fernet(TOKEN_ENC_KEY.encode())
+    except Exception as e:
+        logger.error(f"TOKEN_ENC_KEY / cryptography problem: {type(e).__name__}")
+        return None
+
+def _alpaca_connect_ready():
+    return bool(ALPACA_CLIENT_ID and ALPACA_CLIENT_SECRET and TOKEN_ENC_KEY and _fernet() and SUPABASE_URL and SUPABASE_SERVICE_KEY)
+
+def _state_secret():
+    import hashlib
+    return hashlib.sha256(("state:" + TOKEN_ENC_KEY).encode()).digest()
+
+def _sign_state(user_id):
+    """Short-lived, tamper-proof 'who started this' marker for the Alpaca round trip."""
+    import base64, hmac, hashlib, secrets
+    body = base64.urlsafe_b64encode(json.dumps({"u": user_id, "t": int(time.time()), "n": secrets.token_hex(8)}).encode()).decode().rstrip("=")
+    sig = hmac.new(_state_secret(), body.encode(), hashlib.sha256).hexdigest()
+    return body + "." + sig
+
+def _read_state(state, max_age=900):
+    import base64, hmac, hashlib
+    try:
+        body, sig = str(state).rsplit(".", 1)
+        good = hmac.new(_state_secret(), body.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, good):
+            return None
+        data = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode())
+        if time.time() - int(data["t"]) > max_age:
+            return None
+        return data.get("u")
+    except Exception:
+        return None
+
+def _confirmed_user():
+    """Any signed-in user whose email is confirmed (not just the owner)."""
+    u = current_user()
+    if u and u.get("id") and (u.get("email_confirmed_at") or u.get("confirmed_at")):
+        return u
+    return None
+
+def _sb_rows(table, params):
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}", headers=_sb_headers(), params=params, timeout=10)
+    if not r.ok:
+        raise RuntimeError(f"{table} read failed (HTTP {r.status_code})")
+    return r.json()
+
+def _sb_upsert(table, row):
+    r = requests.post(f"{SUPABASE_URL}/rest/v1/{table}", timeout=10, data=json.dumps(row),
+                      headers=_sb_headers({"Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"}))
+    if not r.ok:
+        raise RuntimeError(f"{table} write failed (HTTP {r.status_code})")
+
+def get_user_alpaca_token(user_id):
+    """The user's decrypted Alpaca token, or None. For the per-user engine in a later step."""
+    f = _fernet()
+    if not f:
+        return None
+    rows = _sb_rows("alpaca_connections", {"user_id": f"eq.{user_id}", "select": "token_encrypted,env,revoked_at"})
+    if not rows or not rows[0].get("token_encrypted") or rows[0].get("revoked_at"):
+        return None
+    try:
+        return f.decrypt(rows[0]["token_encrypted"].encode()).decode()
+    except Exception:
+        return None
+
+@app.route("/api/alpaca/status")
+def alpaca_status():
+    u = _confirmed_user()
+    if not u:
+        return jsonify({"error": "login required"}), 401
+    out = {"configured": _alpaca_connect_ready(), "connected": False, "env": ALPACA_OAUTH_ENV}
+    if out["configured"]:
+        try:
+            rows = _sb_rows("alpaca_connections", {"user_id": f"eq.{u['id']}", "select": "env,connected_at,revoked_at,token_encrypted"})
+            if rows and rows[0].get("token_encrypted") and not rows[0].get("revoked_at"):
+                out.update(connected=True, env=rows[0].get("env") or "paper", connected_at=rows[0].get("connected_at"))
+            st = _sb_rows("user_settings", {"user_id": f"eq.{u['id']}", "select": "risk_level,engine_enabled"})
+            if st:
+                out["settings"] = st[0]
+        except Exception as e:
+            logger.error(f"alpaca status failed: {e}")
+            out["error"] = "could not read your connection status"
+    return jsonify(out)
+
+@app.route("/api/alpaca/connect", methods=["POST"])
+def alpaca_connect():
+    u = _confirmed_user()
+    if not u:
+        return jsonify({"error": "login required"}), 401
+    if not _alpaca_connect_ready():
+        return jsonify({"error": "not configured", "message": "Connecting an Alpaca account is not available yet."}), 503
+    from urllib.parse import urlencode
+    q = urlencode({"response_type": "code", "client_id": ALPACA_CLIENT_ID, "redirect_uri": ALPACA_REDIRECT_URI,
+                   "state": _sign_state(u["id"]), "scope": "trading", "env": ALPACA_OAUTH_ENV})
+    return jsonify({"url": f"{ALPACA_AUTHORIZE_URL}?{q}"})
+
+@app.route("/api/alpaca/callback")
+def alpaca_callback():
+    """Alpaca sends the customer's browser back here. No login header can be present on a
+    redirect, so the signed 'state' proves which signed-in user started the connection."""
+    from flask import redirect
+    def back(result):
+        return redirect(f"{APP_URL}/?alpaca={result}")
+    if request.args.get("error") or not request.args.get("code"):
+        return back("cancelled")
+    if not _alpaca_connect_ready():
+        return back("error")
+    uid = _read_state(request.args.get("state", ""))
+    if not uid:
+        return back("error")
+    try:
+        tr = requests.post(ALPACA_TOKEN_URL, timeout=15, data={
+            "grant_type": "authorization_code", "code": request.args["code"], "client_id": ALPACA_CLIENT_ID,
+            "client_secret": ALPACA_CLIENT_SECRET, "redirect_uri": ALPACA_REDIRECT_URI})
+        if not tr.ok:
+            logger.error(f"Alpaca token exchange failed: HTTP {tr.status_code}")
+            return back("error")
+        token = tr.json().get("access_token")
+        if not token:
+            return back("error")
+        env = ALPACA_OAUTH_ENV
+        chk = requests.get(ALPACA_PAPER_ACCOUNT_URL if env == "paper" else ALPACA_LIVE_ACCOUNT_URL,
+                           headers={"Authorization": f"Bearer {token}"}, timeout=10)
+        if not chk.ok:
+            logger.error(f"Alpaca account check failed: HTTP {chk.status_code}")
+            return back("error")
+        _sb_upsert("alpaca_connections", {"user_id": uid, "env": env, "token_encrypted": _fernet().encrypt(token.encode()).decode(),
+                                          "scope": tr.json().get("scope"), "connected_at": datetime.utcnow().isoformat() + "Z", "revoked_at": None})
+        logger.info(f"Alpaca account connected for user {str(uid)[:8]}…")
+        return back("connected")
+    except Exception as e:
+        logger.error(f"Alpaca callback failed: {type(e).__name__}: {e}")
+        return back("error")
+
+@app.route("/api/alpaca/disconnect", methods=["POST"])
+def alpaca_disconnect():
+    u = _confirmed_user()
+    if not u:
+        return jsonify({"error": "login required"}), 401
+    if not _alpaca_connect_ready():
+        return jsonify({"error": "not configured"}), 503
+    try:
+        _sb_upsert("alpaca_connections", {"user_id": u["id"], "token_encrypted": None, "revoked_at": datetime.utcnow().isoformat() + "Z"})
+    except Exception as e:
+        logger.error(f"alpaca disconnect failed: {e}")
+        return jsonify({"error": "could not disconnect, try again"}), 500
+    return jsonify({"ok": True, "note": "We removed our copy of your connection. Also remove this app in your Alpaca account settings to fully revoke access."})
+
 
 def save_state():
     try:

@@ -3367,6 +3367,7 @@ CUST_ALPACA_BASE = "https://paper-api.alpaca.markets/v2"
 CUST_BASE_RULES = {"scaleOutTier1Frac": 0.34, "scaleOutTier2Frac": 0.33, "cooldownMinutes": 30}
 customer_engine = {"paused": False, "last_cycle": "", "last_users": 0, "last_error": "", "running": False}
 _cust_shared = {"ts": 0.0, "signals": {}, "regime": None}
+_cust_shared_lock = threading.Lock()
 
 def _cust_hdrs(token):
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -3404,6 +3405,10 @@ def _cust_base_signals(price, closes, vol_data, sentiment):
 
 def _cust_refresh_shared(force=False):
     """ONE AI scan for ALL customers (cached 4 minutes), so cost does not grow with customer count."""
+    with _cust_shared_lock:
+        _cust_refresh_shared_locked(force)
+
+def _cust_refresh_shared_locked(force=False):
     now = time.time()
     if not force and _cust_shared["signals"] and now - _cust_shared["ts"] < 240:
         return
@@ -3460,9 +3465,15 @@ def _cust_cooldown_left(st, sym, side, mins):
     left = mins - (time.time() - t) / 60.0
     return left if left > 0 else 0
 
-def _cust_order(token, sym, qty, side):
+def _cust_conn(token):
+    """How to talk to a customer's paper account (OAuth token)."""
+    return {"base": CUST_ALPACA_BASE, "hdrs": _cust_hdrs(token), "dry": False}
+
+def _cust_order(conn, sym, qty, side):
+    if conn.get("dry"):
+        return True      # practice run: pretend it worked, send nothing
     try:
-        r = requests.post(f"{CUST_ALPACA_BASE}/orders", headers=_cust_hdrs(token), timeout=10,
+        r = requests.post(f"{conn['base']}/orders", headers=conn["hdrs"], timeout=10,
                           json={"symbol": sym, "qty": str(qty), "side": side, "type": "market", "time_in_force": "day"})
         return r.ok
     except Exception:
@@ -3477,27 +3488,45 @@ def _cust_revoke(uid):
     except Exception as e:
         logger.error(f"customer revoke failed: {e}")
 
-def run_customer_cycle(uid, token, level, regime, signals):
+def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None):
     """One pass for one customer on their own paper account."""
     r, offset = _cust_rules(level)
-    H = _cust_hdrs(token)
+    conn = conn or _cust_conn(token)
+    H = conn["hdrs"]
+    pre = "(practice run, no order sent) " if conn.get("dry") else ""
+    if caps:   # extra hard limits for the owner's live-money account
+        r["maxDailyLoss"] = min(r["maxDailyLoss"], caps["max_daily_loss"])
     st = _cust_state_load(uid)
     today = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d")
+    if bool(st.get("dry")) != bool(conn.get("dry")):
+        # switching between practice and real: forget notes made by pretend trades
+        st["cooldowns"], st["scale_state"], st["dry"] = {}, {}, bool(conn.get("dry"))
     if st.get("day") != today:
         st["day"] = today; st["limit_logged"] = False
     st["last_scan"] = datetime.utcnow().isoformat() + "Z"
     try:
-        ar = requests.get(f"{CUST_ALPACA_BASE}/account", headers=H, timeout=10)
+        ar = requests.get(f"{conn['base']}/account", headers=H, timeout=10)
         if ar.status_code in (401, 403):
-            _cust_revoke(uid)
+            if caps:
+                live_engine["paused"] = True
+                live_engine["last_error"] = "Alpaca rejected the live keys. Live trading paused."
+            else:
+                _cust_revoke(uid)
             return
         if not ar.ok:
             return
         acct = ar.json()
+        blocked = bool(acct.get("trading_blocked") or acct.get("account_blocked"))
+        if blocked:
+            if not st.get("blocked_logged"):
+                st["blocked_logged"] = True
+                _cust_log(st, "⚠️ Alpaca says trading is blocked on this account. Nothing was traded.")
+            return
+        st["blocked_logged"] = False
         equity, last_equity = float(acct.get("equity", 0)), float(acct.get("last_equity", 0) or 0)
         buying_power = float(acct.get("buying_power", 0) or 0)
-        pr = requests.get(f"{CUST_ALPACA_BASE}/positions", headers=H, timeout=10)
-        orr = requests.get(f"{CUST_ALPACA_BASE}/orders?status=open&limit=200", headers=H, timeout=10)
+        pr = requests.get(f"{conn['base']}/positions", headers=H, timeout=10)
+        orr = requests.get(f"{conn['base']}/orders?status=open&limit=200", headers=H, timeout=10)
         if not pr.ok or not orr.ok:
             return
         positions = {p["symbol"]: p for p in pr.json()}
@@ -3520,9 +3549,9 @@ def run_customer_cycle(uid, token, level, regime, signals):
                 continue
             pct = (price - entry) / entry * 100
             if pct <= -r["maxLossPct"]:
-                if _cust_order(token, sym, qty, "sell"):
+                if _cust_order(conn, sym, qty, "sell"):
                     st["cooldowns"].setdefault(sym, {})["sell"] = time.time(); st["scale_state"].pop(sym, None)
-                    _cust_log(st, f"🛑 Sold {qty} {sym}. It fell {abs(pct):.1f}%, past your {r['maxLossPct']}% stop-loss.")
+                    _cust_log(st, pre + f"🛑 Sold {qty} {sym}. It fell {abs(pct):.1f}%, past your {r['maxLossPct']}% stop-loss.")
                 continue
             ss = st["scale_state"].setdefault(sym, {"origin_qty": qty, "tiers_hit": [False, False]})
             if qty > ss["origin_qty"]:
@@ -3532,16 +3561,16 @@ def run_customer_cycle(uid, token, level, regime, signals):
                 if ss["tiers_hit"][i] or pct < tp:
                     continue
                 sq = min(qty, max(1, round(ss["origin_qty"] * fr)))
-                if _cust_order(token, sym, sq, "sell"):
+                if _cust_order(conn, sym, sq, "sell"):
                     ss["tiers_hit"][i] = True
                     st["cooldowns"].setdefault(sym, {})["sell"] = time.time()
-                    _cust_log(st, f"💰 Sold {sq} {sym} to lock in a gain (+{pct:.1f}%).")
+                    _cust_log(st, pre + f"💰 Sold {sq} {sym} to lock in a gain (+{pct:.1f}%).")
                 acted = True
                 break
             if not acted and pct >= r["scaleOutTier3Pct"]:
-                if _cust_order(token, sym, qty, "sell"):
+                if _cust_order(conn, sym, qty, "sell"):
                     st["cooldowns"].setdefault(sym, {})["sell"] = time.time(); st["scale_state"].pop(sym, None)
-                    _cust_log(st, f"💰 Sold the remaining {qty} {sym} at +{pct:.1f}%.")
+                    _cust_log(st, pre + f"💰 Sold the remaining {qty} {sym} at +{pct:.1f}%.")
         for s in [s for s in st["scale_state"] if s not in positions]:
             st["scale_state"].pop(s, None)
 
@@ -3550,7 +3579,7 @@ def run_customer_cycle(uid, token, level, regime, signals):
         limit_hit = day_pl <= -r["maxDailyLoss"]
         if limit_hit and not st.get("limit_logged"):
             st["limit_logged"] = True
-            _cust_log(st, f"🔴 Daily loss limit reached (${day_pl:.2f}). No new buys today. Selling to protect gains stays active.")
+            _cust_log(st, pre + f"🔴 Daily loss limit reached (${day_pl:.2f}). No new buys today. Selling to protect gains stays active.")
         for sym in MARKET_SCAN_LIST:
             sig = signals.get(sym)
             if not sig:
@@ -3583,6 +3612,23 @@ def run_customer_cycle(uid, token, level, regime, signals):
                         continue
                 if buying_power < price:
                     continue
+                if caps:
+                    if price > caps["max_price"]:
+                        continue
+                    if (cur + 1) * price > caps["max_position"]:
+                        continue
+                    invested = sum(float(p.get("market_value", 0) or 0) for p in positions.values())
+                    invested += sum(q * (signals.get(s2, {}).get("price", 0)) for s2, q in pend_buy.items())
+                    if invested + price > caps["max_invested"]:
+                        continue
+                    # small-account day-trade guard (margin accounts under $25k): stop buying before the limit
+                    try:
+                        if float(acct.get("multiplier", 1) or 1) > 1 and equity < 25000 and int(acct.get("daytrade_count", 0) or 0) >= 2:
+                            continue
+                        if acct.get("pattern_day_trader") and equity < 25000:
+                            continue
+                    except Exception:
+                        pass
             else:
                 if held - pend_sell.get(sym, 0) <= 0:
                     continue
@@ -3590,12 +3636,12 @@ def run_customer_cycle(uid, token, level, regime, signals):
                     continue
             if not is_market_hours():
                 break
-            if _cust_order(token, sym, 1, side):
+            if _cust_order(conn, sym, 1, side):
                 st["cooldowns"].setdefault(sym, {})[side] = time.time()
                 if side == "buy":
-                    _cust_log(st, f"🟢 Bought 1 {sym} at about ${price:.2f}. {agreeing} of {total} signals agreed.")
+                    _cust_log(st, pre + f"🟢 Bought 1 {sym} at about ${price:.2f}. {agreeing} of {total} signals agreed.")
                 else:
-                    _cust_log(st, f"🔴 Sold 1 {sym} at about ${price:.2f} on an AI sell signal.")
+                    _cust_log(st, pre + f"🔴 Sold 1 {sym} at about ${price:.2f} on an AI sell signal.")
             break
     except Exception as e:
         logger.error(f"customer cycle failed for {uid}: {type(e).__name__}: {str(e)[:120]}")
@@ -3642,13 +3688,14 @@ def customer_engine_loop():
             logger.error(f"customer engine error: {customer_engine['last_error']}")
         time.sleep(300)
 
-def _cust_overview(uid, token):
-    """A customer's own paper account at a glance (read-only). Returns a dict, or None if Alpaca can't be reached."""
-    H = _cust_hdrs(token)
-    ar = requests.get(f"{CUST_ALPACA_BASE}/account", headers=H, timeout=10)
+def _cust_overview(uid, token=None, conn=None):
+    """An account at a glance (read-only). Returns a dict, or None if Alpaca can't be reached."""
+    conn = conn or _cust_conn(token)
+    H, base = conn["hdrs"], conn["base"]
+    ar = requests.get(f"{base}/account", headers=H, timeout=10)
     if ar.status_code in (401, 403):
         return {"token_invalid": True}
-    pr = requests.get(f"{CUST_ALPACA_BASE}/positions", headers=H, timeout=10)
+    pr = requests.get(f"{base}/positions", headers=H, timeout=10)
     if not ar.ok or not pr.ok:
         return None
     a = ar.json()
@@ -3714,6 +3761,107 @@ def customer_engine_resume():
     customer_engine["paused"] = False
     return jsonify({"ok": True, "paused": False})
 
+# ===========================================================================
+# Live engine: the OWNER's own real-money Alpaca account (separate from the paper
+# engine and from customers). Off unless LIVE_ENGINE=1 AND live keys are set.
+# Starts in PRACTICE mode (LIVE_DRY_RUN defaults ON): it decides and logs what it
+# WOULD do but sends no orders, until you set LIVE_DRY_RUN=0 in Render.
+# Hard caps (change in Render, no code needed):
+#   LIVE_MAX_INVESTED (400)  LIVE_MAX_POSITION (100)  LIVE_MAX_PRICE (100)  LIVE_MAX_DAILY_LOSS (15)
+#   LIVE_RISK_LEVEL (balanced)
+# ===========================================================================
+LIVE_BASE = "https://api.alpaca.markets/v2"
+LIVE_ENGINE_ENABLED = os.environ.get("LIVE_ENGINE", "").strip() == "1"
+LIVE_KEY = os.environ.get("LIVE_ALPACA_KEY", "").strip()
+LIVE_SECRET = os.environ.get("LIVE_ALPACA_SECRET", "").strip()
+LIVE_DRY_RUN = os.environ.get("LIVE_DRY_RUN", "1").strip() != "0"
+
+def _live_num(name, default):
+    try:
+        v = float(os.environ.get(name, "").strip() or default)
+        return v if v > 0 else float(default)
+    except Exception:
+        return float(default)
+
+LIVE_CAPS = {"max_invested": _live_num("LIVE_MAX_INVESTED", 400), "max_position": _live_num("LIVE_MAX_POSITION", 100),
+             "max_price": _live_num("LIVE_MAX_PRICE", 100), "max_daily_loss": _live_num("LIVE_MAX_DAILY_LOSS", 15)}
+LIVE_RISK = os.environ.get("LIVE_RISK_LEVEL", "balanced").strip().lower()
+if LIVE_RISK not in RISK_PROFILES:
+    LIVE_RISK = "balanced"
+live_engine = {"paused": False, "last_cycle": "", "last_error": "", "running": False}
+_live_uid = {"v": None}
+
+def _live_ready():
+    return bool(LIVE_ENGINE_ENABLED and LIVE_KEY and LIVE_SECRET)
+
+def live_conn():
+    return {"base": LIVE_BASE, "dry": LIVE_DRY_RUN,
+            "hdrs": {"APCA-API-KEY-ID": LIVE_KEY, "APCA-API-SECRET-KEY": LIVE_SECRET, "Content-Type": "application/json"}}
+
+def _live_state_uid():
+    """Where the live engine keeps its notes (cooldowns, activity feed): the owner's own user row."""
+    if _live_uid["v"]:
+        return _live_uid["v"]
+    rows = _sb_rows("profiles", {"email": f"eq.{OWNER_EMAIL}", "select": "user_id"})
+    if rows:
+        _live_uid["v"] = rows[0]["user_id"]
+    return _live_uid["v"]
+
+def live_engine_cycle():
+    if live_engine["paused"] or not _live_ready() or not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        return
+    if not is_market_hours():
+        return
+    uid = _live_state_uid()
+    if not uid:
+        live_engine["last_error"] = "Owner profile not found, live engine idle."
+        return
+    _cust_refresh_shared()
+    run_customer_cycle(uid, None, LIVE_RISK, _cust_shared["regime"] or {}, _cust_shared["signals"], conn=live_conn(), caps=LIVE_CAPS)
+    live_engine["last_cycle"] = datetime.utcnow().isoformat() + "Z"
+
+def live_engine_loop():
+    live_engine["running"] = True
+    while True:
+        try:
+            live_engine_cycle()
+        except Exception as e:
+            live_engine["last_error"] = f"{type(e).__name__}: {str(e)[:120]}"
+            logger.error(f"live engine error: {live_engine['last_error']}")
+        time.sleep(300)
+
+@app.route("/api/live/status")
+@require_api_key
+def live_status():
+    out = {"enabled": LIVE_ENGINE_ENABLED, "keys_set": bool(LIVE_KEY and LIVE_SECRET), "practice_mode": LIVE_DRY_RUN,
+           "paused": live_engine["paused"], "risk_level": LIVE_RISK, "caps": LIVE_CAPS,
+           "last_cycle": live_engine["last_cycle"], "last_error": live_engine["last_error"]}
+    if _live_ready():
+        try:
+            out["account"] = _cust_overview(None, conn=live_conn())
+        except Exception:
+            out["account"] = None
+        try:
+            uid = _live_state_uid()
+            st = _cust_state_load(uid) if uid else {}
+            out["feed"] = (st.get("feed") or [])[:20]
+        except Exception:
+            out["feed"] = []
+    return jsonify(out)
+
+@app.route("/api/live/pause", methods=["POST"])
+@require_api_key
+def live_pause():
+    live_engine["paused"] = True
+    return jsonify({"ok": True, "paused": True})
+
+@app.route("/api/live/resume", methods=["POST"])
+@require_api_key
+def live_resume():
+    live_engine["paused"] = False
+    live_engine["last_error"] = ""
+    return jsonify({"ok": True, "paused": False})
+
 # ---- Background threads: engine, Congress engine, weekly email ----
 # Started from inside the process that SERVES requests, never at import time.
 # gunicorn can import this file in its master process and then fork the worker.
@@ -3747,6 +3895,9 @@ def ensure_background_threads():
         # Customer engine: only exists when CUSTOMER_ENGINE=1. Otherwise nothing runs.
         if CUSTOMER_ENGINE_ENABLED:
             threading.Thread(target=customer_engine_loop, daemon=True).start()
+        # Owner's live-money engine: only with LIVE_ENGINE=1 and live keys; starts in practice mode.
+        if _live_ready():
+            threading.Thread(target=live_engine_loop, daemon=True).start()
 
 @app.before_request
 def _boot_background_threads():

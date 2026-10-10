@@ -3208,7 +3208,7 @@ def tax_report():
     rep = _tax_report(fills, year, v['tax_pct'])
     rep['source'] = 'live' if source == 'live' else 'paper'
     rep['set_aside_so_far'] = round(min(v['tax_reserved'], vault_balance()), 2) if rep['source'] == 'paper' else None
-    rep['history_from'] = LEDGER_HISTORY_FROM if rep['source'] == 'paper' else f"{year - 1}-01-01"
+    rep['history_from'] = (str(_ledger_sync.get('first_fill') or LEDGER_HISTORY_FROM)[:10]) if rep['source'] == 'paper' else f"{year - 1}-01-01"
     return jsonify(rep)
 
 @app.route("/api/vault/withdraw", methods=["POST"])

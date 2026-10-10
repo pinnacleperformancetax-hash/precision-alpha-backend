@@ -844,6 +844,87 @@ def log_scan(msg):
     engine_state['scan_log'].insert(0, entry)
     engine_state['scan_log'] = engine_state['scan_log'][:50]
     logger.info(msg)
+    try:
+        _note_why_not(msg)
+    except Exception:
+        pass
+
+# ---- "Why not?": the latest decision for each scanned stock, in plain English ----
+# Built by reading the scan log lines as they are written, so the engine's own
+# rules are untouched. Resets on restart (it only describes the latest scan).
+why_not = {}
+_WHY_SYM = re.compile(r'^\S+\s+([A-Z][A-Z0-9.]{0,5})\s+\u2014\s+(.*)$')
+_WHY_ORDER = re.compile(r'ORDER PLACED \((.*?)\): (BUY|SELL) (\d+) ([A-Z][A-Z0-9.]*) @ \$([\d.]+)')
+
+def _why_plain(text):
+    """Returns (kind, plain English) for one scan-log reason, or None to ignore it.
+    kind: 'skip' (didn't act), 'passed' (cleared the checks), 'traded'."""
+    t = text.strip()
+    m = re.match(r'blocked \(C:(\d+) V:(\d+) S:(\d+)\)', t)
+    if m:
+        c, v, sy = (int(x) for x in m.groups())
+        bad = []
+        if c < RULES['minConfidence']: bad.append(f"confidence {c} (needs {RULES['minConfidence']} or more)")
+        if v > RULES['maxVolatility']: bad.append(f"volatility {v} (must be {RULES['maxVolatility']} or less)")
+        if sy < RULES['minSyncScore']: bad.append(f"sync score {sy} (needs {RULES['minSyncScore']} or more)")
+        return 'skip', "The AI read wasn't strong enough: " + ('; '.join(bad) if bad else f"confidence {c}, volatility {v}, sync {sy}") + "."
+    m = re.match(r'confluence (\d+)/(\d+) \(need (\d+)\)(?: \[(.*)\])?', t)
+    if m:
+        a, b, need, det = m.group(1), m.group(2), m.group(3), m.group(4) or ''
+        no = [x.split(':')[0].strip() for x in det.split(',') if x.strip().endswith('\u2717')]
+        return 'skip', f"Only {a} of {b} signals agreed, and it needs {need}." + (f" Not agreeing: {', '.join(no)}." if no else '')
+    m = re.match(r'confluence (\d+)/(\d+) agree', t)
+    if m:
+        return 'passed', f"Signals agreed ({m.group(1)} of {m.group(2)}), so it cleared the buy checks."
+    if t.startswith('buy signal ignored: market regime'):
+        return 'skip', "The overall market is trending down, so new buys are paused for every stock."
+    m = re.match(r'max (\d+) shares held/pending', t)
+    if m:
+        return 'skip', f"Already holding the maximum of {m.group(1)} shares, so it won't buy more."
+    m = re.match(r'(BUY|SELL) signal ignored: (?:sold|bought) it recently, cooldown (\d+) more min', t)
+    if m:
+        if m.group(1) == 'BUY':
+            return 'skip', f"Cooling off: the engine sold this stock recently, so it waits about {m.group(2)} more minutes before buying it again."
+        return 'skip', f"Cooling off: the engine bought this stock recently, so it ignores AI sell signals for about {m.group(2)} more minutes (the stop-loss still works)."
+    m = re.match(r'down \$([\d.]+) today \(per-stock limit \$(\d+)', t)
+    if m:
+        return 'skip', f"Down ${m.group(1)} today, past the ${m.group(2)} per-stock limit, so no more buys of it today."
+    if t.startswith('SELL signal but no long shares'):
+        return 'skip', "The AI said sell, but you don't hold any shares and shorting is off."
+    if t.startswith("couldn't verify position"):
+        return 'skip', "Couldn't check your position and open orders, so it skipped to be safe."
+    if t.startswith('no confluence signals'):
+        return 'skip', "Not enough data to score this stock right now."
+    if t.startswith('market closed during this scan'):
+        return 'skip', "The market closed during the scan, so no order was placed."
+    if t.startswith('trading-account cap'):
+        return 'skip', "Skipped: buying more would put more money at risk than the trading account holds."
+    if t.startswith('order failed'):
+        return 'skip', "Alpaca rejected the order."
+    m = re.match(r'(BUY|SELL) signal \((.*?)\)\. Placing', t)
+    if m:
+        return 'passed', f"{m.group(1).capitalize()} signal passed all checks ({m.group(2).lower()}). Order being placed."
+    if t.startswith('bullish sentiment boost') or t.startswith('bearish sentiment'):
+        return None
+    return None
+
+def _why_set(sym, kind, plain):
+    est = datetime.now(pytz.timezone('America/New_York'))
+    why_not[sym] = {'kind': kind, 'plain': plain, 'time': est.strftime('%I:%M %p')}
+
+def _note_why_not(msg):
+    m = _WHY_ORDER.search(msg)
+    if m:
+        label, side, qty, sym, price = m.groups()
+        _why_set(sym, 'traded', f"{'Bought' if side == 'BUY' else 'Sold'} {qty} at ${float(price):.2f} ({label.lower()}).")
+        return
+    m = _WHY_SYM.match(msg)
+    if not m:
+        return
+    sym, rest = m.groups()
+    out = _why_plain(rest)
+    if out:
+        _why_set(sym, out[0], out[1])
 
 def log_customer(msg):
     """Plain-language feed entry — see engine_state['customer_feed'] comment."""
@@ -2016,9 +2097,11 @@ def auto_scan():
     for symbol in MARKET_SCAN_LIST:
         try:
             qr = requests.get(f"{ALPACA_DATA_URL}/stocks/{symbol}/trades/latest", headers=alpaca_hdrs(), timeout=10)
-            if not qr.ok: continue
+            if not qr.ok:
+                _why_set(symbol, 'skip', "Couldn't get a price for it this scan."); continue
             price = qr.json().get('trade', {}).get('p', 0)
-            if not price or price < 5 or price > 500: continue
+            if not price or price < 5 or price > 500:
+                _why_set(symbol, 'skip', ("Price is $%.2f, outside the $5 to $500 range the engine trades." % price) if price else "No price available this scan."); continue
 
             end = datetime.utcnow().isoformat() + 'Z'
             start = (datetime.utcnow() - timedelta(days=3)).isoformat() + 'Z'
@@ -2034,7 +2117,8 @@ def auto_scan():
 
             try:
                 ai, vol_data, sentiment = quick_ai_check(symbol, price, price_change)
-            except: continue
+            except Exception:
+                _why_set(symbol, 'skip', "The AI check didn't return an answer this scan."); continue
 
             conf, vol, sync = ai.get('confidence',0), ai.get('volatility',100), ai.get('sync',0)
             side, reason = ai.get('side','buy'), ai.get('reason','')
@@ -2578,6 +2662,17 @@ def engine_status():
                       "message": ai_health['message'], "since": ai_health['since'],
                       "last_ok": ai_health['last_ok']},
     })
+
+@app.route("/api/engine/why-not")
+def engine_why_not():
+    """Latest decision for every stock the engine scans, in plain English."""
+    rows = []
+    for sym in MARKET_SCAN_LIST:
+        w = why_not.get(sym)
+        rows.append({"symbol": sym, "kind": w["kind"] if w else "none",
+                     "plain": w["plain"] if w else "Not looked at yet since the server last restarted.",
+                     "time": w["time"] if w else ""})
+    return jsonify({"market_open": is_market_hours(), "rows": rows})
 
 @app.route("/api/congress/status")
 def congress_status():

@@ -1283,6 +1283,8 @@ def _vault():
     v.setdefault('swept_total', 0.0)   # cumulative profit swept into the vault
     v.setdefault('moved_total', 0.0)   # cumulative moved from the vault back to the trading account
     v.setdefault('taken_out', 0.0)     # cumulative taken out of the vault (spent / withdrawn)
+    v.setdefault('tax_pct', 0.0)       # % of each swept gain set aside for taxes (0 = off)
+    v.setdefault('tax_reserved', 0.0)  # part of the vault currently set aside for taxes
     v.setdefault('swept', {})
     v.setdefault('history', [])
     return v
@@ -1309,10 +1311,12 @@ def _vault_history(kind, amount, note=''):
 
 def vault_move(action, amount, note=''):
     """Move money out of the vault. action 'take_out' = it leaves (you spent or
-    withdrew it); 'to_trading' = it becomes at-risk trading money again.
-    Bookkeeping only. Raises ValueError with a user-readable message."""
-    if action not in ('take_out', 'to_trading'):
-        raise ValueError("action must be 'take_out' or 'to_trading'")
+    withdrew it); 'to_trading' = it becomes at-risk trading money again;
+    'pay_taxes' = money set aside for taxes leaves the vault to pay them.
+    take_out / to_trading can only use the part of the vault NOT set aside for
+    taxes. Bookkeeping only. Raises ValueError with a user-readable message."""
+    if action not in ('take_out', 'to_trading', 'pay_taxes'):
+        raise ValueError("action must be 'take_out', 'to_trading' or 'pay_taxes'")
     try:
         amount = round(float(amount), 2)
     except (TypeError, ValueError):
@@ -1320,16 +1324,26 @@ def vault_move(action, amount, note=''):
     if amount <= 0:
         raise ValueError("amount must be greater than zero")
     sweep_vault_if_due()  # so a just-closed day's profit is available
-    available = vault_balance()
-    if amount > available + 0.001:
-        raise ValueError(f"the vault only holds ${available:,.2f}")
     v = _vault()
-    key = 'taken_out' if action == 'take_out' else 'moved_total'
-    v[key] = round(v[key] + amount, 2)
+    bal = vault_balance()
+    reserved = round(min(v['tax_reserved'], bal), 2)
+    if action == 'pay_taxes':
+        if amount > reserved + 0.001:
+            raise ValueError(f"only ${reserved:,.2f} is set aside for taxes")
+    else:
+        free = round(bal - reserved, 2)
+        if amount > free + 0.001:
+            raise ValueError(f"only ${free:,.2f} of the vault is free to use (${reserved:,.2f} is set aside for taxes)")
+    if action == 'to_trading':
+        v['moved_total'] = round(v['moved_total'] + amount, 2)
+    else:
+        v['taken_out'] = round(v['taken_out'] + amount, 2)
+    if action == 'pay_taxes':
+        v['tax_reserved'] = round(max(0.0, v['tax_reserved'] - amount), 2)
     _vault_history(action, amount, note)
     save_state()
     return {"action": action, "amount": amount, "vault_balance": vault_balance(),
-            "trading_balance": vault_trading_balance()}
+            "trading_balance": vault_trading_balance(), "tax_reserved": v['tax_reserved']}
 
 def sweep_vault_if_due():
     """Idempotent: sweeps each completed trading day once. Today counts as
@@ -1354,6 +1368,8 @@ def sweep_vault_if_due():
                 amount = round(amount, 2)
             v['swept_total'] = round(v['swept_total'] + amount, 2)
             v['swept'][day] = amount
+            if amount > 0 and v.get('tax_pct', 0) > 0:
+                v['tax_reserved'] = round(v['tax_reserved'] + amount * v['tax_pct'] / 100.0, 2)   # gains only, never losses
             if amount > 0:
                 _vault_history('sweep', amount, day)
             while len(v['swept']) > 60:
@@ -3078,6 +3094,9 @@ def profit_ledger():
             "trading_balance": vault_trading_balance(),
             "vault_balance": vault_balance(),
             "taken_out": _vault()['taken_out'],
+            "tax_pct": _vault()['tax_pct'],
+            "tax_reserved": round(min(_vault()['tax_reserved'], vault_balance()), 2),
+            "keep_balance": round(vault_balance() - min(_vault()['tax_reserved'], vault_balance()), 2),
             "history": _vault()['history'][:8],
             "invested": invested,
             "room_left": None if invested is None else round(vault_trading_balance() - invested, 2),
@@ -3088,6 +3107,110 @@ def profit_ledger():
         "recent": led['entries'][:25],
     })
 
+# ---- Tax summary (information only, not tax advice) ----
+# Matches every sell against earlier buys of the same stock (first in, first out),
+# marks each piece short-term (held 365 days or less) or long-term, and flags losses
+# that MAY be wash sales (another buy of the same stock within 30 days either side).
+# Wash sales are only FLAGGED, never adjusted: a tax preparer decides those.
+def _tax_pieces(fills):
+    from collections import deque
+    et = pytz.timezone('America/New_York')
+    lots, buys, pieces, unmatched = {}, {}, [], 0.0
+    for f in sorted(fills, key=lambda x: x.get('transaction_time') or ''):
+        try:
+            sym, q, p = f['symbol'], float(f['qty']), float(f['price'])
+            t = datetime.fromisoformat(f['transaction_time'].replace('Z', '+00:00')).astimezone(et).date()
+        except Exception:
+            continue
+        side = str(f.get('side', '')).lower()
+        if q <= 0 or p <= 0 or side not in ('buy', 'sell'):
+            continue
+        mult = 100 if _OCC_RE.match(sym) else 1
+        dq = lots.setdefault(sym, deque())
+        if side == 'buy':
+            buys.setdefault(sym, []).append((t, f.get('id')))
+            dq.append([q, p, t, f.get('id')])
+            continue
+        remaining = q
+        while remaining > 1e-9 and dq:
+            lot = dq[0]
+            m = min(lot[0], remaining)
+            gain = round((p - lot[1]) * m * mult, 2)
+            pieces.append({'symbol': sym, 'qty': int(m) if m % 1 == 0 else round(m, 4),
+                           'acquired': lot[2].isoformat(), 'sold': t.isoformat(),
+                           'proceeds': round(p * m * mult, 2), 'cost': round(lot[1] * m * mult, 2),
+                           'gain': gain, 'term': 'long' if (t - lot[2]).days > 365 else 'short', '_buy_id': lot[3]})
+            lot[0] -= m
+            remaining -= m
+            if lot[0] <= 1e-9:
+                dq.popleft()
+        if remaining > 1e-9:
+            unmatched += remaining
+    for pc in pieces:
+        pc['possible_wash_sale'] = False
+        if pc['gain'] < 0:
+            sd = datetime.strptime(pc['sold'], '%Y-%m-%d').date()
+            pc['possible_wash_sale'] = any(bid != pc['_buy_id'] and abs((d - sd).days) <= 30 for d, bid in buys.get(pc['symbol'], []))
+    for pc in pieces:
+        pc.pop('_buy_id', None)
+    return pieces, round(unmatched, 2)
+
+def _tax_report(fills, year, rate_pct):
+    pieces, unmatched = _tax_pieces(fills)
+    yp = [p for p in pieces if p['sold'].startswith(str(year))]
+    def agg(term):
+        rows = [p for p in yp if p['term'] == term]
+        g = round(sum(p['gain'] for p in rows if p['gain'] > 0), 2)
+        l = round(sum(p['gain'] for p in rows if p['gain'] < 0), 2)
+        return {'gains': g, 'losses': l, 'net': round(g + l, 2)}
+    st, lt = agg('short'), agg('long')
+    net = round(st['net'] + lt['net'], 2)
+    return {'year': year, 'short_term': st, 'long_term': lt, 'net': net,
+            'rate_pct': rate_pct, 'estimated_tax': round(max(0.0, net) * rate_pct / 100.0, 2),
+            'possible_wash_sales': sum(1 for p in yp if p['possible_wash_sale']),
+            'unmatched_sell_shares': unmatched, 'rows': yp}
+
+def _fetch_fills_conn(conn, after_iso):
+    """All fills since after_iso for one account (used for the live account's tax summary). None if unreadable."""
+    out, params = [], {'direction': 'asc', 'page_size': 100, 'after': after_iso}
+    for _ in range(80):
+        r = requests.get(f"{conn['base']}/account/activities/FILL", headers=conn['hdrs'], params=params, timeout=20)
+        if not r.ok:
+            return None
+        rows = r.json()
+        out.extend(rows)
+        if len(rows) < 100:
+            return out
+        params['page_token'] = rows[-1].get('id')
+    return out
+
+@app.route("/api/tax/report")
+@require_api_key
+def tax_report():
+    est = datetime.now(pytz.timezone('America/New_York'))
+    try:
+        year = int(request.args.get('year') or est.year)
+    except ValueError:
+        return jsonify({"error": "year must be a number"}), 400
+    if not (2020 <= year <= 2100):
+        return jsonify({"error": "year out of range"}), 400
+    source = request.args.get('source', 'paper')
+    v = _vault()
+    if source == 'live':
+        if not _live_ready():
+            return jsonify({"error": "The live account is not switched on yet."}), 409
+        fills = _fetch_fills_conn(live_conn(), f"{year - 1}-01-01T00:00:00Z")
+        if fills is None:
+            return jsonify({"error": "Alpaca is not answering right now."}), 502
+    else:
+        sync_ledger_from_fills()
+        fills = list(_fill_cache['fills'])
+    rep = _tax_report(fills, year, v['tax_pct'])
+    rep['source'] = 'live' if source == 'live' else 'paper'
+    rep['set_aside_so_far'] = round(min(v['tax_reserved'], vault_balance()), 2) if rep['source'] == 'paper' else None
+    rep['history_from'] = LEDGER_HISTORY_FROM if rep['source'] == 'paper' else f"{year - 1}-01-01"
+    return jsonify(rep)
+
 @app.route("/api/vault/withdraw", methods=["POST"])
 @require_api_key
 def vault_withdraw():
@@ -3096,7 +3219,7 @@ def vault_withdraw():
         result = vault_move(data.get('action'), data.get('amount'), data.get('note', ''))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
-    label = "taken out of the vault" if result['action'] == 'take_out' else "moved from the vault to the trading account"
+    label = {"take_out": "taken out of the vault", "pay_taxes": "paid out of the tax set-aside"}.get(result['action'], "moved from the vault to the trading account")
     log_scan(f"🏦 ${result['amount']:,.2f} {label} (vault now ${result['vault_balance']:,.2f}, trading ${result['trading_balance']:,.2f})")
     log_customer(f"🏦 ${result['amount']:,.2f} {label}.")
     return jsonify(result)
@@ -3114,6 +3237,14 @@ def set_vault():
         if not (1000 <= amt <= 10_000_000):
             return jsonify({"error": "trading_start must be between 1,000 and 10,000,000"}), 400
         v['trading_start'] = round(amt, 2)
+    if 'tax_pct' in data:
+        try:
+            tp = float(data['tax_pct'])
+        except (TypeError, ValueError):
+            return jsonify({"error": "tax_pct must be a number"}), 400
+        if not (0 <= tp <= 60):
+            return jsonify({"error": "tax_pct must be between 0 and 60"}), 400
+        v['tax_pct'] = round(tp, 1)
     for key in ('cap_enabled', 'refill_first'):
         if key in data:
             v[key] = bool(data[key])
@@ -3121,7 +3252,7 @@ def set_vault():
     log_scan(f"🏦 Vault settings: trading account ${v['trading_start']:,.0f}, "
              f"cap {'ON' if v['cap_enabled'] else 'off'}, refill-first {'ON' if v['refill_first'] else 'off'}")
     return jsonify({"trading_start": v['trading_start'], "cap_enabled": v['cap_enabled'],
-                    "refill_first": v['refill_first'], "trading_balance": vault_trading_balance()})
+                    "refill_first": v['refill_first'], "tax_pct": v['tax_pct'], "trading_balance": vault_trading_balance()})
 
 @app.route("/api/storage/status")
 def storage_status():

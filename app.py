@@ -3800,6 +3800,61 @@ def _cust_revoke(uid):
     except Exception as e:
         logger.error(f"customer revoke failed: {e}")
 
+def _sim_apply(st, sym, qty, side, price):
+    """Practice mode only: record a pretend fill so caps, stop-loss, take-profit and cash limits
+    behave next cycle exactly as they would with real holdings."""
+    sim = st.get("sim")
+    if not sim or price <= 0 or qty <= 0:
+        return
+    today = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d")
+    pos = sim["pos"]
+    if side == "buy":
+        p = pos.get(sym) or {"qty": 0, "avg": 0.0}
+        tot = p["qty"] + qty
+        p["avg"] = round((p["qty"] * p["avg"] + qty * price) / tot, 4)
+        p["qty"] = tot
+        p["ref"], p["ref_day"] = (p.get("ref") or price) if p.get("ref_day") == today else price, today
+        pos[sym] = p
+        sim["cash"] = round(sim["cash"] - qty * price, 2)
+    else:
+        p = pos.get(sym)
+        if not p:
+            return
+        q = min(qty, p["qty"])
+        sim["realized"] = round(sim.get("realized", 0.0) + (price - p["avg"]) * q, 2)
+        sim["cash"] = round(sim["cash"] + q * price, 2)
+        p["qty"] -= q
+        if p["qty"] <= 0:
+            pos.pop(sym, None)
+
+def _sim_overlay(st, signals, positions, cash_now, today):
+    """Practice mode only: add the pretend holdings to the real ones and return (equity, last_equity, buying_power)."""
+    sim = st.get("sim")
+    if not sim:
+        sim = st["sim"] = {"cash": round(cash_now, 2), "pos": {}, "realized": 0.0, "day": None, "day_start": None}
+    held_value = 0.0
+    for sym, p in list(sim["pos"].items()):
+        price = float((signals.get(sym) or {}).get("price") or 0) or p["avg"]
+        if p.get("ref_day") != today:
+            p["ref_day"], p["ref"] = today, price
+        if sym in positions:
+            continue            # a real position in the same stock wins
+        positions[sym] = {"symbol": sym, "qty": str(p["qty"]), "avg_entry_price": str(p["avg"]),
+                          "current_price": str(price), "market_value": str(round(p["qty"] * price, 2)),
+                          "unrealized_intraday_pl": str(round((price - p["ref"]) * p["qty"], 2))}
+        held_value += p["qty"] * price
+    equity = round(sim["cash"] + held_value, 2)
+    if sim.get("day") != today:
+        sim["day"], sim["day_start"] = today, equity
+    return equity, float(sim["day_start"] or equity), max(0.0, sim["cash"])
+
+def _sim_summary(st):
+    sim = st.get("sim")
+    if not sim:
+        return None
+    return {"cash": sim.get("cash"), "realized": sim.get("realized", 0.0),
+            "positions": [{"symbol": k, "qty": v["qty"], "avg": v["avg"]} for k, v in sim["pos"].items()]}
+
 def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None):
     """One pass for one customer on their own paper account."""
     r, offset = _cust_rules(level)
@@ -3813,6 +3868,7 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
     if bool(st.get("dry")) != bool(conn.get("dry")):
         # switching between practice and real: forget notes made by pretend trades
         st["cooldowns"], st["scale_state"], st["dry"] = {}, {}, bool(conn.get("dry"))
+        st["sim"] = None
     if st.get("day") != today:
         st["day"] = today; st["limit_logged"] = False
     st["last_scan"] = datetime.utcnow().isoformat() + "Z"
@@ -3848,6 +3904,8 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
         if not pr.ok or not orr.ok:
             return
         positions = {p["symbol"]: p for p in pr.json()}
+        if conn.get("dry"):
+            equity, last_equity, buying_power = _sim_overlay(st, signals, positions, cash_now, today)
         pend_buy, pend_sell = {}, {}
         for o in orr.json():
             q = int(float(o.get("qty") or 0))
@@ -3868,6 +3926,7 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
             pct = (price - entry) / entry * 100
             if pct <= -r["maxLossPct"]:
                 if _cust_order(conn, sym, qty, "sell"):
+                    if conn.get("dry"): _sim_apply(st, sym, qty, "sell", price)
                     st["cooldowns"].setdefault(sym, {})["sell"] = time.time(); st["scale_state"].pop(sym, None)
                     _cust_log(st, pre + f"🛑 Sold {qty} {sym}. It fell {abs(pct):.1f}%, past your {r['maxLossPct']}% stop-loss.")
                 else:
@@ -3882,6 +3941,7 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                     continue
                 sq = min(qty, max(1, round(ss["origin_qty"] * fr)))
                 if _cust_order(conn, sym, sq, "sell"):
+                    if conn.get("dry"): _sim_apply(st, sym, sq, "sell", price)
                     ss["tiers_hit"][i] = True
                     st["cooldowns"].setdefault(sym, {})["sell"] = time.time()
                     _cust_log(st, pre + f"💰 Sold {sq} {sym} to lock in a gain (+{pct:.1f}%).")
@@ -3891,6 +3951,7 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                 break
             if not acted and pct >= r["scaleOutTier3Pct"]:
                 if _cust_order(conn, sym, qty, "sell"):
+                    if conn.get("dry"): _sim_apply(st, sym, qty, "sell", price)
                     st["cooldowns"].setdefault(sym, {})["sell"] = time.time(); st["scale_state"].pop(sym, None)
                     _cust_log(st, pre + f"💰 Sold the remaining {qty} {sym} at +{pct:.1f}%.")
                 else:
@@ -3963,6 +4024,7 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
             if not is_market_hours():
                 break
             if _cust_order(conn, sym, 1, side):
+                if conn.get("dry"): _sim_apply(st, sym, 1, side, price)
                 st["cooldowns"].setdefault(sym, {})[side] = time.time()
                 if side == "buy" and cash_acct:
                     st["day_spend"] = round(st.get("day_spend", 0.0) + price, 2)
@@ -4175,8 +4237,16 @@ def live_status():
             uid = _live_state_uid()
             st = _cust_state_load(uid) if uid else {}
             out["feed"] = (st.get("feed") or [])[:20]
+            out["sim"] = _sim_summary(st) if LIVE_DRY_RUN else None
         except Exception:
             out["feed"] = []
+        try:
+            a = requests.get(f"{LIVE_BASE}/account", headers=live_conn()["hdrs"], timeout=10).json()
+            mult = float(a.get("multiplier", 1) or 1)
+            out["account_type"] = {"kind": "cash" if mult <= 1 else "margin", "multiplier": mult,
+                                   "daytrade_count": a.get("daytrade_count"), "pdt": bool(a.get("pattern_day_trader"))}
+        except Exception:
+            out["account_type"] = None
     return jsonify(out)
 
 @app.route("/api/live/pause", methods=["POST"])

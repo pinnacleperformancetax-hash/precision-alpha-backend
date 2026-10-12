@@ -1,3 +1,4 @@
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from functools import wraps
@@ -716,10 +717,80 @@ def is_market_hours():
     except Exception as e:
         logger.warning(f"Alpaca clock lookup failed, using local fallback: {e}")
     est = datetime.now(pytz.timezone('America/New_York'))
-    if est.weekday() >= 5:  # Saturday/Sunday
+    return _local_market_open(est)
+
+def _nth_weekday(year, month, weekday, n):
+    """Date of the n-th given weekday of a month (n=-1 means the last one)."""
+    from datetime import date as _d
+    if n > 0:
+        d = _d(year, month, 1)
+        d += timedelta(days=(weekday - d.weekday()) % 7 + 7 * (n - 1))
+        return d
+    d = _d(year + (month == 12), (month % 12) + 1, 1) - timedelta(days=1)
+    return d - timedelta(days=(d.weekday() - weekday) % 7)
+
+def _easter(year):
+    a, b, c = year % 19, year // 100, year % 100
+    d, e = b // 4, b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    from datetime import date as _d
+    return _d(year, month, day)
+
+def _nyse_holidays(year):
+    """Full-day NYSE closures for a year (backup list only; Alpaca's clock is the real source)."""
+    from datetime import date as _d
+    def observed(d):
+        if d.weekday() == 5:
+            return d - timedelta(days=1)
+        if d.weekday() == 6:
+            return d + timedelta(days=1)
+        return d
+    hol = {
+        observed(_d(year, 1, 1)),
+        _nth_weekday(year, 1, 0, 3),            # Martin Luther King Jr. Day
+        _nth_weekday(year, 2, 0, 3),            # Presidents Day
+        _easter(year) - timedelta(days=2),      # Good Friday
+        _nth_weekday(year, 5, 0, -1),           # Memorial Day
+        observed(_d(year, 6, 19)),              # Juneteenth
+        observed(_d(year, 7, 4)),               # Independence Day
+        _nth_weekday(year, 9, 0, 1),            # Labor Day
+        _nth_weekday(year, 11, 3, 4),           # Thanksgiving
+        observed(_d(year, 12, 25)),             # Christmas
+    }
+    # A Saturday New Year's Day is not observed on the Friday before.
+    if _d(year, 1, 1).weekday() == 5:
+        hol.discard(_d(year - 1, 12, 31))
+    return hol
+
+def _nyse_early_close(d):
+    """True on days the market closes at 1:00 PM (backup list only)."""
+    from datetime import date as _d
+    if d == _nth_weekday(d.year, 11, 3, 4) + timedelta(days=1):    # day after Thanksgiving
+        return True
+    if d.month == 12 and d.day == 24 and d.weekday() < 5:
+        return True
+    if d.month == 7 and d.day == 3 and d.weekday() < 5 and _d(d.year, 7, 4).weekday() < 5:
+        return True
+    return False
+
+def _local_market_open(est):
+    """Backup check used only when Alpaca's clock can't be reached: weekends, US market holidays,
+    1 PM early closes, and the 9:30-4:00 window."""
+    if est.weekday() >= 5:
         return False
+    d = est.date()
+    if d in _nyse_holidays(d.year):
+        return False
+    close_h = 13 if _nyse_early_close(d) else 16
     h, m = est.hour, est.minute
-    return (h > 9 or (h == 9 and m >= 30)) and h < 16
+    return (h > 9 or (h == 9 and m >= 30)) and h < close_h
 
 def reset_if_needed():
     today = datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d')
@@ -3701,9 +3772,25 @@ def _cust_order(conn, sym, qty, side):
     try:
         r = requests.post(f"{conn['base']}/orders", headers=conn["hdrs"], timeout=10,
                           json={"symbol": sym, "qty": str(qty), "side": side, "type": "market", "time_in_force": "day"})
-        return r.ok
-    except Exception:
+        if r.ok:
+            conn["last_err"] = None
+            return True
+        try:
+            why = (r.json() or {}).get("message") or r.text[:120]
+        except Exception:
+            why = r.text[:120]
+        conn["last_err"] = f"Alpaca said no ({r.status_code}): {str(why)[:120]}"
         return False
+    except Exception as e:
+        conn["last_err"] = f"Could not reach Alpaca ({type(e).__name__})"
+        return False
+
+def _cust_reject(st, conn, sym, side, qty, pre=""):
+    """An order Alpaca refused: say so in the feed and cool the stock down so the same refusal is not
+    repeated every five minutes. A refused SELL is never put on cooldown (a stop-loss must keep retrying)."""
+    _cust_log(st, pre + f"⚠️ {side.title()} of {qty} {sym} was not accepted. {conn.get('last_err') or ''}".strip())
+    if side == "buy":
+        st["cooldowns"].setdefault(sym, {})["buy"] = time.time()
 
 def _cust_revoke(uid):
     """Alpaca says the token is no longer valid: stop trading for this customer."""
@@ -3749,6 +3836,12 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                 _cust_log(st, "⚠️ Alpaca says trading is blocked on this account. Nothing was traded.")
             return
         st["blocked_logged"] = False
+        # Cash account (no margin): never re-spend TODAY's sale proceeds. Buying with money that has not
+        # settled and then selling that new position before it settles is a "good faith violation".
+        cash_now = float(acct.get("cash", 0) or 0)
+        cash_acct = bool(caps) and float(acct.get("multiplier", 1) or 1) <= 1
+        if cash_acct and st.get("cash_day") != today:
+            st["cash_day"], st["cash_start"], st["day_spend"] = today, cash_now, 0.0
         equity, last_equity = float(acct.get("equity", 0)), float(acct.get("last_equity", 0) or 0)
         buying_power = float(acct.get("buying_power", 0) or 0)
         pr = requests.get(f"{conn['base']}/positions", headers=H, timeout=10)
@@ -3778,6 +3871,8 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                 if _cust_order(conn, sym, qty, "sell"):
                     st["cooldowns"].setdefault(sym, {})["sell"] = time.time(); st["scale_state"].pop(sym, None)
                     _cust_log(st, pre + f"🛑 Sold {qty} {sym}. It fell {abs(pct):.1f}%, past your {r['maxLossPct']}% stop-loss.")
+                else:
+                    _cust_reject(st, conn, sym, "sell", qty, pre)
                 continue
             ss = st["scale_state"].setdefault(sym, {"origin_qty": qty, "tiers_hit": [False, False]})
             if qty > ss["origin_qty"]:
@@ -3791,12 +3886,16 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                     ss["tiers_hit"][i] = True
                     st["cooldowns"].setdefault(sym, {})["sell"] = time.time()
                     _cust_log(st, pre + f"💰 Sold {sq} {sym} to lock in a gain (+{pct:.1f}%).")
+                else:
+                    _cust_reject(st, conn, sym, "sell", sq, pre)
                 acted = True
                 break
             if not acted and pct >= r["scaleOutTier3Pct"]:
                 if _cust_order(conn, sym, qty, "sell"):
                     st["cooldowns"].setdefault(sym, {})["sell"] = time.time(); st["scale_state"].pop(sym, None)
                     _cust_log(st, pre + f"💰 Sold the remaining {qty} {sym} at +{pct:.1f}%.")
+                else:
+                    _cust_reject(st, conn, sym, "sell", qty, pre)
         for s in [s for s in st["scale_state"] if s not in positions]:
             st["scale_state"].pop(s, None)
 
@@ -3838,6 +3937,8 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                         continue
                 if buying_power < price:
                     continue
+                if cash_acct and st.get("day_spend", 0.0) + price > st.get("cash_start", 0.0):
+                    continue          # would spend money from today's sales (not settled yet)
                 if caps:
                     if price > caps["max_price"]:
                         continue
@@ -3864,10 +3965,14 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                 break
             if _cust_order(conn, sym, 1, side):
                 st["cooldowns"].setdefault(sym, {})[side] = time.time()
+                if side == "buy" and cash_acct:
+                    st["day_spend"] = round(st.get("day_spend", 0.0) + price, 2)
                 if side == "buy":
                     _cust_log(st, pre + f"🟢 Bought 1 {sym} at about ${price:.2f}. {agreeing} of {total} signals agreed.")
                 else:
                     _cust_log(st, pre + f"🔴 Sold 1 {sym} at about ${price:.2f} on an AI sell signal.")
+            else:
+                _cust_reject(st, conn, sym, side, 1, pre)
             break
     except Exception as e:
         logger.error(f"customer cycle failed for {uid}: {type(e).__name__}: {str(e)[:120]}")

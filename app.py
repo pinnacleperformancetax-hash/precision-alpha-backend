@@ -3879,6 +3879,7 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
         # switching between practice and real: forget notes made by pretend trades
         st["cooldowns"], st["scale_state"], st["dry"] = {}, {}, bool(conn.get("dry"))
         st["sim"] = None
+        st["breaker"] = None
     if st.get("day") != today:
         st["day"] = today; st["limit_logged"] = False
     st["last_scan"] = datetime.utcnow().isoformat() + "Z"
@@ -3972,6 +3973,22 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
         # 2) New buys / AI sell signals, one trade per cycle, with the daily loss limit
         day_pl = equity - last_equity if last_equity > 0 else 0.0
         limit_hit = day_pl <= -r["maxDailyLoss"]
+        if caps:   # owner's live account only: drawdown circuit breaker (latched until the owner resumes)
+            br = st.get("breaker") or {}
+            if live_engine.get("breaker_reset"):
+                live_engine["breaker_reset"] = False
+                if br.get("tripped"):
+                    _cust_log(st, pre + "✅ Circuit breaker reset by you. New buys are allowed again.")
+                br = {}
+            if equity > 0:
+                br["peak"] = max(float(br.get("peak") or 0), equity)
+                floor = br["peak"] * (1 - LIVE_MAX_DRAWDOWN_PCT / 100.0)
+                if not br.get("tripped") and equity <= floor:
+                    br.update({"tripped": True, "tripped_at": datetime.utcnow().isoformat() + "Z", "equity_at_trip": round(equity, 2)})
+                    _cust_log(st, pre + f"🚨 CIRCUIT BREAKER: account value ${equity:.2f} is {LIVE_MAX_DRAWDOWN_PCT:g}% or more below its high of ${br['peak']:.2f}. No new buys until you press Resume buying. Selling to protect money stays active.")
+            st["breaker"] = br
+            if br.get("tripped"):
+                limit_hit = True
         if limit_hit and not st.get("limit_logged"):
             st["limit_logged"] = True
             _cust_log(st, pre + f"🔴 Daily loss limit reached (${day_pl:.2f}). No new buys today. Selling to protect gains stays active.")
@@ -4187,10 +4204,13 @@ def _live_num(name, default):
 
 LIVE_CAPS = {"max_invested": _live_num("LIVE_MAX_INVESTED", 400), "max_position": _live_num("LIVE_MAX_POSITION", 100),
              "max_price": _live_num("LIVE_MAX_PRICE", 100), "max_daily_loss": _live_num("LIVE_MAX_DAILY_LOSS", 15)}
+# Drawdown circuit breaker: if the live account falls this % below its highest value, new buys stop
+# (sells and stop-losses keep working) until the owner presses "Resume buying" on the dashboard.
+LIVE_MAX_DRAWDOWN_PCT = _live_num("LIVE_MAX_DRAWDOWN_PCT", 10)
 LIVE_RISK = os.environ.get("LIVE_RISK_LEVEL", "balanced").strip().lower()
 if LIVE_RISK not in RISK_PROFILES:
     LIVE_RISK = "balanced"
-live_engine = {"paused": False, "last_cycle": "", "last_error": "", "running": False}
+live_engine = {"paused": False, "last_cycle": "", "last_error": "", "running": False, "breaker_reset": False}
 _live_uid = {"v": None}
 
 def _live_ready():
@@ -4248,6 +4268,10 @@ def live_status():
             st = _cust_state_load(uid) if uid else {}
             out["feed"] = (st.get("feed") or [])[:20]
             out["sim"] = _sim_summary(st) if LIVE_DRY_RUN else None
+            br = st.get("breaker") or {}
+            out["breaker"] = {"max_drawdown_pct": LIVE_MAX_DRAWDOWN_PCT, "peak": br.get("peak"), "tripped": bool(br.get("tripped")),
+                              "tripped_at": br.get("tripped_at"), "equity_at_trip": br.get("equity_at_trip"),
+                              "reset_pending": live_engine.get("breaker_reset", False)}
         except Exception:
             out["feed"] = []
         try:
@@ -4271,6 +4295,14 @@ def live_resume():
     live_engine["paused"] = False
     live_engine["last_error"] = ""
     return jsonify({"ok": True, "paused": False})
+
+@app.route("/api/live/breaker/reset", methods=["POST"])
+@require_api_key
+def live_breaker_reset():
+    """Owner presses 'Resume buying' after a breaker trip (or after adding/withdrawing money, which moves the
+    high-water mark). The next cycle clears the trip and starts a fresh high from the current account value."""
+    live_engine["breaker_reset"] = True
+    return jsonify({"ok": True})
 
 # ---- Background threads: engine, Congress engine, weekly email ----
 # Started from inside the process that SERVES requests, never at import time.

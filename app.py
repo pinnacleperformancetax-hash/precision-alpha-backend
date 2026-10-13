@@ -53,14 +53,25 @@ ALERT_EMAIL       = os.environ.get("ALERT_EMAIL", "pinnacleperformancetax@gmail.
 # configure it, but you should set API_KEY as soon as possible.
 API_KEY = os.environ.get("API_KEY", "")
 
+
+def _safe_err(e):
+    """Log the real error; tell the caller only that something went wrong."""
+    logger.error(f"{request.path}: {type(e).__name__}: {str(e)[:200]}")
+    return jsonify({"error": "server error"}), 500
+
+@app.after_request
+def _security_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    resp.headers.setdefault("Cache-Control", "no-store")
+    return resp
+
 def require_api_key(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        if not API_KEY:
-            logger.warning(f"⚠️ API_KEY not set — {request.path} is UNPROTECTED")
-            return fn(*args, **kwargs)
-        supplied = request.headers.get("X-API-Key", "")
-        if supplied != API_KEY and not _is_owner(current_user()):
+        if not _has_valid_api_key() and not _is_owner(current_user()):
             return jsonify({"error": "unauthorized"}), 401
         return fn(*args, **kwargs)
     return wrapper
@@ -260,7 +271,8 @@ def _remote_kick():
 # The old X-API-Key keeps working as a second way in (scripts, emergencies).
 SUPABASE_PUBLISHABLE_KEY = os.environ.get("SUPABASE_PUBLISHABLE_KEY", "sb_publishable_AiHOWwrehmi2eTOX-OVwmg_llh_-oih").strip()
 OWNER_EMAIL = os.environ.get("OWNER_EMAIL", ALERT_EMAIL).strip().lower()
-REQUIRE_LOGIN = os.environ.get("REQUIRE_LOGIN", "").strip() == "1"
+# Fails CLOSED: login is required unless you deliberately set REQUIRE_LOGIN=0.
+REQUIRE_LOGIN = os.environ.get("REQUIRE_LOGIN", "1").strip() != "0"
 _auth_cache = {}  # token -> (expires_at, user_dict_or_None)
 
 def _verify_token(token):
@@ -307,7 +319,8 @@ def _is_owner(user):
     return bool(email) and email == OWNER_EMAIL and confirmed
 
 def _has_valid_api_key():
-    return bool(API_KEY) and request.headers.get("X-API-Key", "") == API_KEY
+    import hmac
+    return bool(API_KEY) and hmac.compare_digest(request.headers.get("X-API-Key", "").encode(), API_KEY.encode())
 
 @app.before_request
 def _enforce_login():
@@ -2785,7 +2798,7 @@ def get_bars(symbol):
     try:
         res = requests.get(f"{ALPACA_DATA_URL}/stocks/{symbol}/bars?timeframe=1Day&start={request.args.get('start','')}&end={request.args.get('end','')}&limit=5", headers=alpaca_hdrs(), timeout=10)
         return jsonify(res.json()), res.status_code
-    except Exception as e: return jsonify({"error": str(e)}), 500
+    except Exception as e: return _safe_err(e)
 
 # ---- Options: Step 1 (contract lookup only, no order placement yet) ----
 # GET /v2/options/contracts is a TRADING API endpoint (same host as /v2/orders
@@ -2812,7 +2825,7 @@ def get_option_contracts(symbol):
         res = requests.get(f"{ALPACA_BASE_URL}/options/contracts", headers=alpaca_hdrs(), params=params, timeout=15)
         return jsonify(res.json()), res.status_code
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _safe_err(e)
 
 @app.route("/api/options/contracts/lookup/<contract_symbol>")
 def get_single_option_contract(contract_symbol):
@@ -2823,7 +2836,7 @@ def get_single_option_contract(contract_symbol):
         res = requests.get(f"{ALPACA_BASE_URL}/options/contracts/{contract_symbol}", headers=alpaca_hdrs(), timeout=10)
         return jsonify(res.json()), res.status_code
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _safe_err(e)
 
 @app.route("/api/options/quote/<contract_symbol>")
 def get_option_live_quote(contract_symbol):
@@ -2850,7 +2863,7 @@ def get_option_live_quote(contract_symbol):
         mid = round((bid + ask) / 2, 4) if bid is not None and ask is not None else None
         return jsonify({"symbol": contract_symbol, "bid": bid, "ask": ask, "mid": mid})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _safe_err(e)
 
 @app.route("/api/options/orders", methods=["POST"])
 @require_api_key
@@ -2901,7 +2914,7 @@ def place_option_order():
             log_scan(f"🎯 OPTION ORDER PLACED: {side.upper()} {qty}x {contract_symbol}")
         return jsonify(res.json()), res.status_code
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _safe_err(e)
 
 @app.route("/api/options/orders/multi-leg", methods=["POST"])
 @require_api_key
@@ -2978,7 +2991,7 @@ def place_multi_leg_option_order():
             logger.error(f"Multi-leg order rejected: HTTP {res.status_code} — {res.text[:300]}")
         return jsonify(res.json()), res.status_code
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _safe_err(e)
 
 # ---- Options: Edge Score scanner ----
 # This is a DETERMINISTIC heuristic, not AI-driven and not investment advice.
@@ -3137,38 +3150,35 @@ def options_edge_scan():
             'total_candidates_found': len(all_candidates),
         })
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _safe_err(e)
 
 
     try:
         res = requests.get(f"{ALPACA_DATA_URL}/stocks/{symbol}/trades/latest", headers=alpaca_hdrs(), timeout=10)
         return jsonify(res.json()), res.status_code
-    except Exception as e: return jsonify({"error": str(e)}), 500
+    except Exception as e: return _safe_err(e)
 
 @app.route("/api/account")
 def get_account():
     try:
         res = requests.get(f"{ALPACA_BASE_URL}/account", headers=alpaca_hdrs(), timeout=10)
         return jsonify(res.json()), res.status_code
-    except Exception as e: return jsonify({"error": str(e)}), 500
+    except Exception as e: return _safe_err(e)
 
 @app.route("/api/positions")
 def get_positions():
     try:
         res = requests.get(f"{ALPACA_BASE_URL}/positions", headers=alpaca_hdrs(), timeout=10)
         return jsonify(res.json()), res.status_code
-    except Exception as e: return jsonify({"error": str(e)}), 500
+    except Exception as e: return _safe_err(e)
 
 @app.route("/api/orders", methods=["GET","POST"])
 def orders():
     # Only the POST side (placing an order) needs the key — GET (reading
     # order history) stays open like the other read-only routes.
     if request.method == "POST":
-        if API_KEY:
-            if request.headers.get("X-API-Key", "") != API_KEY:
-                return jsonify({"error": "unauthorized"}), 401
-        else:
-            logger.warning("⚠️ API_KEY not set — POST /api/orders is UNPROTECTED")
+        if not _has_valid_api_key() and not _is_owner(current_user()):
+            return jsonify({"error": "unauthorized"}), 401
     try:
         if request.method == "POST":
             order_data = request.get_json() or {}
@@ -3194,7 +3204,7 @@ def orders():
                 q += f"&after={after}"
             res = requests.get(f"{ALPACA_BASE_URL}/orders?{q}", headers=alpaca_hdrs(), timeout=10)
         return jsonify(res.json()), res.status_code
-    except Exception as e: return jsonify({"error": str(e)}), 500
+    except Exception as e: return _safe_err(e)
 
 @app.route("/api/ai/analyze", methods=["POST"])
 @require_api_key
@@ -3206,7 +3216,7 @@ def ai_analyze():
             json={"model": "claude-haiku-4-5-20251001", "max_tokens": data.get("max_tokens", 500), "messages": [{"role": "user", "content": data.get("prompt", "")}]},
             timeout=25)
         return jsonify(res.json()), res.status_code
-    except Exception as e: return jsonify({"error": str(e)}), 500
+    except Exception as e: return _safe_err(e)
 
 
 
@@ -3596,7 +3606,7 @@ def get_trade_history():
             }
         })
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _safe_err(e)
 
 @app.route("/api/news/<symbol>")
 def get_news(symbol):
@@ -3610,7 +3620,7 @@ def get_news(symbol):
             return jsonify(res.json()), 200
         return jsonify({"news": []}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _safe_err(e)
 
 @app.route("/api/news/market")
 def get_market_news():
@@ -3624,7 +3634,7 @@ def get_market_news():
             return jsonify(res.json()), 200
         return jsonify({"news": []}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _safe_err(e)
 
 # Benchmark state — persists in memory (resets on server restart)
 benchmark_state = {

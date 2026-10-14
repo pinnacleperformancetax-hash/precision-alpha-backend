@@ -4048,6 +4048,8 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                     continue
                 if _cust_cooldown_left(st, sym, "buy", r["cooldownMinutes"]) > 0:
                     continue
+                if caps and _cust_cooldown_left(st, sym, "buy", LIVE_MIN_HOLD_MINUTES) > 0:
+                    continue          # live account: hold a while before an AI sell signal can close it
             if not is_market_hours():
                 break
             if _cust_order(conn, sym, 1, side):
@@ -4207,6 +4209,9 @@ LIVE_CAPS = {"max_invested": _live_num("LIVE_MAX_INVESTED", 400), "max_position"
 # Drawdown circuit breaker: if the live account falls this % below its highest value, new buys stop
 # (sells and stop-losses keep working) until the owner presses "Resume buying" on the dashboard.
 LIVE_MAX_DRAWDOWN_PCT = _live_num("LIVE_MAX_DRAWDOWN_PCT", 10)
+# Minimum hold: the live account will not sell a stock on an AI "sell" signal until it has held it at least
+# this many minutes (stop-loss and profit-taking sales are never delayed). Cuts small in-and-out trades.
+LIVE_MIN_HOLD_MINUTES = _live_num("LIVE_MIN_HOLD_MINUTES", 120)
 LIVE_RISK = os.environ.get("LIVE_RISK_LEVEL", "balanced").strip().lower()
 if LIVE_RISK not in RISK_PROFILES:
     LIVE_RISK = "balanced"
@@ -4256,7 +4261,7 @@ def live_engine_loop():
 @require_api_key
 def live_status():
     out = {"enabled": LIVE_ENGINE_ENABLED, "keys_set": bool(LIVE_KEY and LIVE_SECRET), "practice_mode": LIVE_DRY_RUN,
-           "paused": live_engine["paused"], "risk_level": LIVE_RISK, "caps": LIVE_CAPS,
+           "paused": live_engine["paused"], "risk_level": LIVE_RISK, "caps": LIVE_CAPS, "min_hold_minutes": LIVE_MIN_HOLD_MINUTES,
            "last_cycle": live_engine["last_cycle"], "last_error": live_engine["last_error"]}
     if _live_ready():
         try:

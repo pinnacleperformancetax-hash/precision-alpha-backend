@@ -804,6 +804,13 @@ def _local_market_open(est):
     h, m = est.hour, est.minute
     return (h > 9 or (h == 9 and m >= 30)) and h < close_h
 
+def _minutes_to_close(est=None):
+    """Minutes left until today's close (4:00 PM, or 1:00 PM on early-close days), New York time.
+    Negative once the close has passed. Used by the live account's near-close buy cutoff."""
+    est = est or datetime.now(pytz.timezone('America/New_York'))
+    close_h = 13 if _nyse_early_close(est.date()) else 16
+    return (close_h * 60) - (est.hour * 60 + est.minute) - (est.second / 60.0)
+
 def reset_if_needed():
     today = datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d')
     changed = False
@@ -4027,6 +4034,10 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                 if cash_acct and st.get("day_spend", 0.0) + price > st.get("cash_start", 0.0):
                     continue          # would spend money from today's sales (not settled yet)
                 if caps:
+                    # near-close cutoff: no NEW live buys in the last N minutes, so fewer positions are
+                    # carried overnight into a gap. Stops, profit-taking and AI sells keep working.
+                    if LIVE_NO_BUY_LAST_MINUTES > 0 and _minutes_to_close() < LIVE_NO_BUY_LAST_MINUTES:
+                        continue
                     if price > caps["max_price"]:
                         continue
                     if (cur + 1) * price > caps["max_position"]:
@@ -4204,14 +4215,19 @@ def _live_num(name, default):
     except Exception:
         return float(default)
 
-LIVE_CAPS = {"max_invested": _live_num("LIVE_MAX_INVESTED", 400), "max_position": _live_num("LIVE_MAX_POSITION", 100),
-             "max_price": _live_num("LIVE_MAX_PRICE", 100), "max_daily_loss": _live_num("LIVE_MAX_DAILY_LOSS", 15)}
+LIVE_CAPS = {"max_invested": _live_num("LIVE_MAX_INVESTED", 250), "max_position": _live_num("LIVE_MAX_POSITION", 100),
+             "max_price": _live_num("LIVE_MAX_PRICE", 100), "max_daily_loss": _live_num("LIVE_MAX_DAILY_LOSS", 10)}
 # Drawdown circuit breaker: if the live account falls this % below its highest value, new buys stop
 # (sells and stop-losses keep working) until the owner presses "Resume buying" on the dashboard.
-LIVE_MAX_DRAWDOWN_PCT = _live_num("LIVE_MAX_DRAWDOWN_PCT", 10)
+LIVE_MAX_DRAWDOWN_PCT = _live_num("LIVE_MAX_DRAWDOWN_PCT", 5)
 # Minimum hold: the live account will not sell a stock on an AI "sell" signal until it has held it at least
 # this many minutes (stop-loss and profit-taking sales are never delayed). Cuts small in-and-out trades.
 LIVE_MIN_HOLD_MINUTES = _live_num("LIVE_MIN_HOLD_MINUTES", 120)
+# Near-close cutoff: no new live buys in the last N minutes before the close (0 turns it off).
+try:
+    LIVE_NO_BUY_LAST_MINUTES = max(0.0, float(os.environ.get("LIVE_NO_BUY_LAST_MINUTES", "").strip() or 60))
+except Exception:
+    LIVE_NO_BUY_LAST_MINUTES = 60.0
 LIVE_RISK = os.environ.get("LIVE_RISK_LEVEL", "balanced").strip().lower()
 if LIVE_RISK not in RISK_PROFILES:
     LIVE_RISK = "balanced"
@@ -4262,6 +4278,7 @@ def live_engine_loop():
 def live_status():
     out = {"enabled": LIVE_ENGINE_ENABLED, "keys_set": bool(LIVE_KEY and LIVE_SECRET), "practice_mode": LIVE_DRY_RUN,
            "paused": live_engine["paused"], "risk_level": LIVE_RISK, "caps": LIVE_CAPS, "min_hold_minutes": LIVE_MIN_HOLD_MINUTES,
+           "no_buy_last_minutes": LIVE_NO_BUY_LAST_MINUTES,
            "last_cycle": live_engine["last_cycle"], "last_error": live_engine["last_error"]}
     if _live_ready():
         try:

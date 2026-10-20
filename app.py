@@ -3619,7 +3619,7 @@ def get_trade_history():
 # Track-record scorecard (paper account): the evidence a funded program,
 # a lawyer, or you would want before any real scaling. Read-only.
 # ---------------------------------------------------------------------------
-def compute_scorecard(equity_pts, spy_pts, fills):
+def compute_scorecard(equity_pts, spy_pts, fills, exposure_pts=None):
     """equity_pts: [(date_str, equity)] oldest->newest. spy_pts: [(date_str, close)].
     fills: [{'symbol','side','qty','price','time'(ISO)}] oldest->newest.
     Pure function (no network) so it can be tested."""
@@ -3652,6 +3652,16 @@ def compute_scorecard(equity_pts, spy_pts, fills):
         if d0 and d1 and d0 != d1:
             out["spy_return_pct"] = round((spy[d1] / spy[d0] - 1) * 100, 2)
             out["vs_spy_pct"] = round(out["return_pct"] - out["spy_return_pct"], 2)
+        if exposure_pts:
+            # Fair benchmark: the S&P with the SAME dollars invested on the SAME days.
+            exp = {d: float(v) for d, v in exposure_pts}
+            pnl = 0.0
+            for i in range(1, len(pts)):
+                a, b = pts[i - 1][0], pts[i][0]
+                if a in exp and a in spy and b in spy and spy[a]:
+                    pnl += exp[a] * (spy[b] / spy[a] - 1)
+            out["spy_matched_pct"] = round(pnl / eq[0] * 100, 2)
+            out["vs_spy_matched_pct"] = round(out["return_pct"] - out["spy_matched_pct"], 2)
     # closed trades via FIFO matching of fills per symbol
     lots, closed = {}, []
     for f in fills:
@@ -3699,7 +3709,10 @@ def compute_scorecard(equity_pts, spy_pts, fills):
     chk("At least 30 closed trades (enough to judge)", t["closed_trades"] >= 30, f"{t['closed_trades']} closed trades")
     if "max_drawdown_pct" in out:
         chk("Worst drop under 5%", out["max_drawdown_pct"] < 5, f"{out['max_drawdown_pct']}%")
-    if "vs_spy_pct" in out:
+    if "vs_spy_matched_pct" in out:
+        chk("Beating the S&P 500 on the same dollars invested", out["vs_spy_matched_pct"] > 0,
+            f"{out['vs_spy_matched_pct']:+}% vs S&P with the same money")
+    elif "vs_spy_pct" in out:
         chk("Beating the S&P 500 over the same days", out["vs_spy_pct"] > 0, f"{out['vs_spy_pct']:+}% vs S&P")
     if t.get("profit_factor") is not None:
         chk("Profit factor above 1.3 (gains / losses)", t["profit_factor"] > 1.3, str(t["profit_factor"]))
@@ -3707,6 +3720,30 @@ def compute_scorecard(equity_pts, spy_pts, fills):
         pos = sum(1 for v in out["monthly_pct"].values() if v > 0)
         chk("Most months profitable", pos > len(out["monthly_pct"]) / 2, f"{pos} of {len(out['monthly_pct'])} months")
     out["checks"] = checks
+    return out
+
+
+def exposure_from_fills(fills, dates):
+    """Approximate dollars invested (at cost) at the end of each date, replayed from fills."""
+    lots, out, i = {}, [], 0
+    fs = sorted(fills, key=lambda f: f["time"])
+    for d in dates:
+        while i < len(fs) and fs[i]["time"][:10] <= d:
+            f = fs[i]
+            i += 1
+            q, px = float(f["qty"]), float(f["price"])
+            if f["side"] == "buy":
+                lots.setdefault(f["symbol"], []).append([q, px])
+            else:
+                rem = q
+                while rem > 1e-9 and lots.get(f["symbol"]):
+                    lot = lots[f["symbol"]][0]
+                    take = min(rem, lot[0])
+                    lot[0] -= take
+                    rem -= take
+                    if lot[0] <= 1e-9:
+                        lots[f["symbol"]].pop(0)
+        out.append((d, sum(l[0] * l[1] for v in lots.values() for l in v)))
     return out
 
 
@@ -3748,7 +3785,7 @@ def scorecard():
                 break
             after = batch[-1].get("submitted_at")
         fills.sort(key=lambda f: f["time"])
-        return jsonify(compute_scorecard(eq_pts, spy_pts, fills))
+        return jsonify(compute_scorecard(eq_pts, spy_pts, fills, exposure_from_fills(fills, [d for d, _ in eq_pts])))
     except Exception as e:
         return _safe_err(e)
 
@@ -3771,7 +3808,7 @@ def _bt_rsi(closes, n=14):
 
 def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_invested=250.0,
                  max_position=100.0, max_price=100.0, stop_pct=4.0, max_hold_days=10,
-                 daily_loss=10.0, slippage_pct=0.05):
+                 daily_loss=10.0, slippage_pct=0.05, use_regime=True, regime_buffer_pct=0.0):
     """bars: {symbol: [{'d','o','h','l','c','v'}...]} oldest->newest; must include 'SPY'.
     Signals use data through the close of day t; orders fill at the open of day t+1.
     Returns {'equity': [(date, equity)], 'trades': [...], 'spy': [(date, close)]}. Pure function."""
@@ -3779,7 +3816,7 @@ def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_
     dates = [b["d"] for b in spy]
     idx = {s: {b["d"]: i for i, b in enumerate(v)} for s, v in bars.items()}
     cash, held, pending_buy, pending_sell = float(capital), {}, [], set()
-    equity, trades = [], []
+    equity, trades, exposure = [], [], []
     slip = slippage_pct / 100.0
     prev_eq = capital
     for di, d in enumerate(dates):
@@ -3828,12 +3865,16 @@ def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_
             j = idx.get(sym, {}).get(d)
             eq += pos["qty"] * (bars[sym][j]["c"] if j is not None else pos["entry"])
         equity.append((d, eq))
+        exposure.append((d, eq - cash))
         day_pl = eq - prev_eq
         prev_eq = eq
         # 4. signals at the close -> orders for tomorrow
         spy_closes = [b["c"] for b in spy[:di + 1]]
         sma_spy = _bt_sma(spy_closes, 20)
-        bull = sma_spy is not None and spy_closes[-1] > sma_spy
+        if use_regime:
+            bull = sma_spy is not None and spy_closes[-1] > sma_spy * (1 - regime_buffer_pct / 100.0)
+        else:
+            bull = True
         for sym, pos in held.items():
             j = idx.get(sym, {}).get(d)
             if j is None:
@@ -3879,12 +3920,12 @@ def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_
         invested = sum(p["qty"] * p["entry"] for p in held.values())
         slots = int(max(0, max_invested - invested) // max_position)
         pending_buy = [sym for _, sym in cands[:slots]]
-    return {"equity": equity, "trades": trades, "spy": [(b["d"], b["c"]) for b in spy]}
+    return {"equity": equity, "trades": trades, "exposure": exposure, "spy": [(b["d"], b["c"]) for b in spy]}
 
 
 def summarize_backtest(res, split_frac=0.7):
     """Full period plus in-sample / out-of-sample halves, using the scorecard math."""
-    eq, tr, spy = res["equity"], res["trades"], res["spy"]
+    eq, tr, spy, ex = res["equity"], res["trades"], res["spy"], res.get("exposure")
     def fills_for(trs):
         f = []
         for t in trs:
@@ -3892,12 +3933,12 @@ def summarize_backtest(res, split_frac=0.7):
             f.append({"symbol": t["symbol"], "side": "sell", "qty": t["qty"], "price": t["exit"], "time": t["exit_d"] + "T14:31:00Z"})
         f.sort(key=lambda x: x["time"])
         return f
-    out = {"full": compute_scorecard(eq, spy, fills_for(tr))}
+    out = {"full": compute_scorecard(eq, spy, fills_for(tr), ex)}
     if len(eq) > 40:
         k = int(len(eq) * split_frac)
         cut = eq[k - 1][0]
-        out["in_sample"] = compute_scorecard(eq[:k], spy, fills_for([t for t in tr if t["exit_d"] <= cut]))
-        out["out_of_sample"] = compute_scorecard(eq[k - 1:], spy, fills_for([t for t in tr if t["exit_d"] > cut]))
+        out["in_sample"] = compute_scorecard(eq[:k], spy, fills_for([t for t in tr if t["exit_d"] <= cut]), ex)
+        out["out_of_sample"] = compute_scorecard(eq[k - 1:], spy, fills_for([t for t in tr if t["exit_d"] > cut]), ex)
         out["split_date"] = cut
     return out
 
@@ -3932,15 +3973,21 @@ def backtest_route():
         bars = _bt_load_bars(2)
         if not bars.get("SPY") or len(bars["SPY"]) < 100:
             return jsonify({"error": "Not enough price history returned"}), 502
-        variants = [("Trend + momentum + volume (all 3 agree)", dict(strategy="technical", min_signals=3)),
-                    ("Trend + momentum + volume (2 of 3 agree)", dict(strategy="technical", min_signals=2)),
-                    ("Mean reversion (buy a sharp dip, sell the bounce)", dict(strategy="mean_reversion"))]
+        variants = []
+        for n, label in ((3, "all 3 agree"), (2, "2 of 3 agree")):
+            variants += [
+                (f"Trend + momentum + volume ({label}) · market filter ON (strict)", dict(strategy="technical", min_signals=n)),
+                (f"Trend + momentum + volume ({label}) · market filter loosened (S&P may be up to 2% below its 20-day average)", dict(strategy="technical", min_signals=n, regime_buffer_pct=2.0)),
+                (f"Trend + momentum + volume ({label}) · market filter OFF", dict(strategy="technical", min_signals=n, use_regime=False)),
+            ]
+        variants.append(("Mean reversion (buy a sharp dip, sell the bounce)", dict(strategy="mean_reversion")))
         results = []
         for name, kw in variants:
             results.append({"name": name, "result": summarize_backtest(run_backtest(bars, **kw))})
         return jsonify({"symbols": len([k for k in bars if k != "SPY"]), "days": len(bars["SPY"]), "variants": results,
                         "notes": ["Technical rules only; sentiment and AI signals cannot be replayed on past data.",
                                   "Orders fill at the next day's open with 0.05% slippage per side.",
+                                  "'S&P with the same dollars' puts the same amount of money into the S&P on the same days the strategy was invested, so the comparison is fair.",
                                   "Ignores cash-account settlement delays, so real results would trade less often."]})
     except Exception as e:
         return _safe_err(e)

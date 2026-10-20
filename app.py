@@ -3673,7 +3673,7 @@ def compute_scorecard(equity_pts, spy_pts, fills, exposure_pts=None):
             while rem > 1e-9 and lots.get(sym):
                 lot = lots[sym][0]
                 take = min(rem, lot[0])
-                closed.append({"symbol": sym, "pl": (px - lot[1]) * take,
+                closed.append({"symbol": sym, "pl": (px - lot[1]) * take, "qty": take, "notional": take * lot[1],
                                "pct": (px / lot[1] - 1) * 100 if lot[1] else 0,
                                "t_in": lot[2], "t_out": f["time"]})
                 lot[0] -= take
@@ -3700,6 +3700,58 @@ def compute_scorecard(equity_pts, spy_pts, fills, exposure_pts=None):
                 pass
         if holds:
             t["avg_hold_minutes"] = round(sum(holds) / len(holds))
+        # Where the money is made: by holding time, entry time of day, symbol, and after costs.
+        def _hb(m):
+            return ("under 1 hour" if m < 60 else "1 to 4 hours" if m < 240 else "4 hours to 1 day" if m < 1440
+                    else "1 to 3 days" if m < 4320 else "over 3 days")
+        order_h = ["under 1 hour", "1 to 4 hours", "4 hours to 1 day", "1 to 3 days", "over 3 days"]
+        try:
+            from zoneinfo import ZoneInfo
+            _ny = ZoneInfo("America/New_York")
+        except Exception:
+            try:
+                import pytz as _pz
+                _ny = _pz.timezone("America/New_York")
+            except Exception:
+                _ny = None
+        def _eb(iso):
+            try:
+                a = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+                a = a.astimezone(_ny) if _ny else a - timedelta(hours=5)
+                m = a.hour * 60 + a.minute
+            except Exception:
+                return None
+            return ("before 10:30" if m < 630 else "10:30 to 12:00" if m < 720 else "12:00 to 2:00" if m < 840
+                    else "2:00 to 3:00" if m < 900 else "after 3:00")
+        order_e = ["before 10:30", "10:30 to 12:00", "12:00 to 2:00", "2:00 to 3:00", "after 3:00"]
+        hb, eb, bysym = {}, {}, {}
+        for c in closed:
+            try:
+                a = datetime.fromisoformat(c["t_in"].replace("Z", "+00:00"))
+                b2 = datetime.fromisoformat(c["t_out"].replace("Z", "+00:00"))
+                key = _hb((b2 - a).total_seconds() / 60.0)
+            except Exception:
+                key = None
+            for store, k in ((hb, key), (eb, _eb(c["t_in"]))):
+                if k is None:
+                    continue
+                r = store.setdefault(k, [0, 0.0, 0])
+                r[0] += 1
+                r[1] += c["pl"]
+                r[2] += 1 if c["pl"] > 0 else 0
+            bysym[c["symbol"]] = bysym.get(c["symbol"], 0.0) + c["pl"]
+        def _rows(store, order):
+            return [{"bucket": k, "trades": store[k][0], "pl": round(store[k][1], 2),
+                     "win_rate_pct": round(100.0 * store[k][2] / store[k][0], 1)} for k in order if k in store]
+        ranked = sorted(bysym.items(), key=lambda kv: kv[1])
+        notional = sum(c["notional"] for c in closed)
+        tot = sum(c["pl"] for c in closed)
+        t["breakdown"] = {
+            "by_hold": _rows(hb, order_h), "by_entry_time": _rows(eb, order_e),
+            "best_symbols": [[k, round(v, 2)] for k, v in ranked[::-1][:5]],
+            "worst_symbols": [[k, round(v, 2)] for k, v in ranked[:5]],
+            "after_costs": [{"bps": bp, "net": round(tot - notional * 2 * bp / 10000.0, 2)} for bp in (0, 5, 10, 20)],
+        }
     out["trades"] = t
     # readiness checks against the targets discussed (not a prediction)
     checks = []

@@ -3615,6 +3615,337 @@ def get_trade_history():
     except Exception as e:
         return _safe_err(e)
 
+# ---------------------------------------------------------------------------
+# Track-record scorecard (paper account): the evidence a funded program,
+# a lawyer, or you would want before any real scaling. Read-only.
+# ---------------------------------------------------------------------------
+def compute_scorecard(equity_pts, spy_pts, fills):
+    """equity_pts: [(date_str, equity)] oldest->newest. spy_pts: [(date_str, close)].
+    fills: [{'symbol','side','qty','price','time'(ISO)}] oldest->newest.
+    Pure function (no network) so it can be tested."""
+    out = {"days": 0}
+    pts = [(d, float(e)) for d, e in equity_pts if e and float(e) > 0]
+    if len(pts) >= 2:
+        eq = [e for _, e in pts]
+        out["days"] = len(pts) - 1
+        out["start_date"], out["end_date"] = pts[0][0], pts[-1][0]
+        out["start_equity"], out["end_equity"] = round(eq[0], 2), round(eq[-1], 2)
+        out["return_pct"] = round((eq[-1] / eq[0] - 1) * 100, 2)
+        rets = [(eq[i] / eq[i - 1] - 1) * 100 for i in range(1, len(eq))]
+        out["profitable_days_pct"] = round(100.0 * sum(1 for r in rets if r > 0) / len(rets), 1)
+        out["best_day_pct"], out["worst_day_pct"] = round(max(rets), 2), round(min(rets), 2)
+        peak, mdd = eq[0], 0.0
+        for e in eq:
+            peak = max(peak, e)
+            mdd = max(mdd, (peak - e) / peak * 100)
+        out["max_drawdown_pct"] = round(mdd, 2)
+        months, last_eq, prev_end = {}, {}, eq[0]
+        for d, e in pts:
+            last_eq[d[:7]] = e
+        for m in sorted(last_eq):
+            months[m] = round((last_eq[m] / prev_end - 1) * 100, 2)
+            prev_end = last_eq[m]
+        out["monthly_pct"] = months
+        spy = {d: float(c) for d, c in spy_pts if c}
+        d0 = next((d for d, _ in pts if d in spy), None)
+        d1 = next((d for d, _ in reversed(pts) if d in spy), None)
+        if d0 and d1 and d0 != d1:
+            out["spy_return_pct"] = round((spy[d1] / spy[d0] - 1) * 100, 2)
+            out["vs_spy_pct"] = round(out["return_pct"] - out["spy_return_pct"], 2)
+    # closed trades via FIFO matching of fills per symbol
+    lots, closed = {}, []
+    for f in fills:
+        sym, qty, px = f["symbol"], float(f["qty"]), float(f["price"])
+        if f["side"] == "buy":
+            lots.setdefault(sym, []).append([qty, px, f["time"]])
+        else:
+            rem = qty
+            while rem > 1e-9 and lots.get(sym):
+                lot = lots[sym][0]
+                take = min(rem, lot[0])
+                closed.append({"symbol": sym, "pl": (px - lot[1]) * take,
+                               "pct": (px / lot[1] - 1) * 100 if lot[1] else 0,
+                               "t_in": lot[2], "t_out": f["time"]})
+                lot[0] -= take
+                rem -= take
+                if lot[0] <= 1e-9:
+                    lots[sym].pop(0)
+    t = {"closed_trades": len(closed)}
+    if closed:
+        wins = [c["pl"] for c in closed if c["pl"] > 0]
+        losses = [-c["pl"] for c in closed if c["pl"] <= 0]
+        t["win_rate_pct"] = round(100.0 * len(wins) / len(closed), 1)
+        t["avg_win"] = round(sum(wins) / len(wins), 2) if wins else 0
+        t["avg_loss"] = round(sum(losses) / len(losses), 2) if losses else 0
+        t["profit_factor"] = round(sum(wins) / sum(losses), 2) if losses and sum(losses) > 0 else None
+        t["expectancy_per_trade"] = round(sum(c["pl"] for c in closed) / len(closed), 2)
+        t["total_pl"] = round(sum(c["pl"] for c in closed), 2)
+        holds = []
+        for c in closed:
+            try:
+                a = datetime.fromisoformat(c["t_in"].replace("Z", "+00:00"))
+                b = datetime.fromisoformat(c["t_out"].replace("Z", "+00:00"))
+                holds.append((b - a).total_seconds() / 60.0)
+            except Exception:
+                pass
+        if holds:
+            t["avg_hold_minutes"] = round(sum(holds) / len(holds))
+    out["trades"] = t
+    # readiness checks against the targets discussed (not a prediction)
+    checks = []
+    def chk(name, ok, detail):
+        checks.append({"name": name, "ok": ok, "detail": detail})
+    chk("At least 60 trading days of history", out["days"] >= 60, f"{out['days']} days so far")
+    chk("At least 30 closed trades (enough to judge)", t["closed_trades"] >= 30, f"{t['closed_trades']} closed trades")
+    if "max_drawdown_pct" in out:
+        chk("Worst drop under 5%", out["max_drawdown_pct"] < 5, f"{out['max_drawdown_pct']}%")
+    if "vs_spy_pct" in out:
+        chk("Beating the S&P 500 over the same days", out["vs_spy_pct"] > 0, f"{out['vs_spy_pct']:+}% vs S&P")
+    if t.get("profit_factor") is not None:
+        chk("Profit factor above 1.3 (gains / losses)", t["profit_factor"] > 1.3, str(t["profit_factor"]))
+    if out.get("monthly_pct"):
+        pos = sum(1 for v in out["monthly_pct"].values() if v > 0)
+        chk("Most months profitable", pos > len(out["monthly_pct"]) / 2, f"{pos} of {len(out['monthly_pct'])} months")
+    out["checks"] = checks
+    return out
+
+
+@app.route("/api/scorecard")
+@require_api_key
+def scorecard():
+    """Track record of the paper account vs the S&P 500 (SPY)."""
+    try:
+        r = requests.get(f"{ALPACA_BASE_URL}/account/portfolio/history", headers=alpaca_hdrs(),
+                         params={"period": "1A", "timeframe": "1D"}, timeout=15)
+        if not r.ok:
+            return jsonify({"error": "Could not read account history"}), 502
+        h = r.json()
+        eq_pts = []
+        for ts, e in zip(h.get("timestamp") or [], h.get("equity") or []):
+            if e:
+                eq_pts.append((datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d"), e))
+        spy_pts = []
+        if eq_pts:
+            br = requests.get(f"{ALPACA_DATA_URL}/stocks/SPY/bars", headers=alpaca_hdrs(), timeout=15,
+                              params={"timeframe": "1Day", "start": eq_pts[0][0] + "T00:00:00Z",
+                                      "limit": 400, "feed": "iex"})
+            if br.ok:
+                spy_pts = [(b["t"][:10], b["c"]) for b in br.json().get("bars", [])]
+        fills, after = [], None
+        for _ in range(5):
+            params = {"status": "closed", "limit": 500, "direction": "asc"}
+            if after:
+                params["after"] = after
+            orr = requests.get(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(), params=params, timeout=15)
+            if not orr.ok:
+                break
+            batch = orr.json()
+            for o in batch:
+                if o.get("status") == "filled" and o.get("filled_at") and o.get("filled_avg_price"):
+                    fills.append({"symbol": o["symbol"], "side": o["side"], "qty": o.get("filled_qty") or 0,
+                                  "price": o["filled_avg_price"], "time": o["filled_at"]})
+            if len(batch) < 500:
+                break
+            after = batch[-1].get("submitted_at")
+        fills.sort(key=lambda f: f["time"])
+        return jsonify(compute_scorecard(eq_pts, spy_pts, fills))
+    except Exception as e:
+        return _safe_err(e)
+
+
+# ---------------------------------------------------------------------------
+# Backtester (read-only; sends no orders). Replays the TECHNICAL rules on
+# daily bars. Sentiment and AI signals cannot be replayed historically, so
+# they are not included -- results show what the chart-based rules alone do.
+# ---------------------------------------------------------------------------
+def _bt_sma(vals, n):
+    return sum(vals[-n:]) / n if len(vals) >= n else None
+
+def _bt_rsi(closes, n=14):
+    if len(closes) < n + 1:
+        return None
+    g = [max(closes[i] - closes[i - 1], 0) for i in range(1, len(closes))][-n:]
+    l = [max(closes[i - 1] - closes[i], 0) for i in range(1, len(closes))][-n:]
+    ag, al = sum(g) / n, sum(l) / n
+    return 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+
+def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_invested=250.0,
+                 max_position=100.0, max_price=100.0, stop_pct=4.0, max_hold_days=10,
+                 daily_loss=10.0, slippage_pct=0.05):
+    """bars: {symbol: [{'d','o','h','l','c','v'}...]} oldest->newest; must include 'SPY'.
+    Signals use data through the close of day t; orders fill at the open of day t+1.
+    Returns {'equity': [(date, equity)], 'trades': [...], 'spy': [(date, close)]}. Pure function."""
+    spy = bars.get("SPY") or []
+    dates = [b["d"] for b in spy]
+    idx = {s: {b["d"]: i for i, b in enumerate(v)} for s, v in bars.items()}
+    cash, held, pending_buy, pending_sell = float(capital), {}, [], set()
+    equity, trades = [], []
+    slip = slippage_pct / 100.0
+    prev_eq = capital
+    for di, d in enumerate(dates):
+        # 1. fills at today's open (orders queued yesterday)
+        for sym in list(pending_sell):
+            if sym in held and d in idx.get(sym, {}):
+                b = bars[sym][idx[sym][d]]
+                px = b["o"] * (1 - slip)
+                pos = held.pop(sym)
+                cash += pos["qty"] * px
+                trades.append({"symbol": sym, "qty": pos["qty"], "entry": pos["entry"], "exit": px,
+                               "entry_d": pos["d"], "exit_d": d, "why": "signal"})
+        pending_sell = set()
+        for sym in pending_buy:
+            if sym in held or d not in idx.get(sym, {}):
+                continue
+            b = bars[sym][idx[sym][d]]
+            px = b["o"] * (1 + slip)
+            invested = sum(p["qty"] * p["entry"] for p in held.values())
+            budget = min(max_position, max_invested - invested, cash)
+            qty = int(budget // px) if px > 0 else 0
+            if qty >= 1 and px <= max_price * 1.05:
+                cash -= qty * px
+                held[sym] = {"qty": qty, "entry": px, "d": d, "i": di}
+        pending_buy = []
+        # 2. stop-loss during the day
+        for sym in list(held):
+            if d not in idx.get(sym, {}):
+                continue
+            b = bars[sym][idx[sym][d]]
+            pos = held[sym]
+            stop = pos["entry"] * (1 - stop_pct / 100.0)
+            if b["o"] <= stop:
+                px = b["o"]
+            elif b["l"] <= stop:
+                px = stop
+            else:
+                continue
+            held.pop(sym)
+            cash += pos["qty"] * px
+            trades.append({"symbol": sym, "qty": pos["qty"], "entry": pos["entry"], "exit": px,
+                           "entry_d": pos["d"], "exit_d": d, "why": "stop"})
+        # 3. mark to market at the close
+        eq = cash
+        for sym, pos in held.items():
+            j = idx.get(sym, {}).get(d)
+            eq += pos["qty"] * (bars[sym][j]["c"] if j is not None else pos["entry"])
+        equity.append((d, eq))
+        day_pl = eq - prev_eq
+        prev_eq = eq
+        # 4. signals at the close -> orders for tomorrow
+        spy_closes = [b["c"] for b in spy[:di + 1]]
+        sma_spy = _bt_sma(spy_closes, 20)
+        bull = sma_spy is not None and spy_closes[-1] > sma_spy
+        for sym, pos in held.items():
+            j = idx.get(sym, {}).get(d)
+            if j is None:
+                continue
+            closes = [b["c"] for b in bars[sym][:j + 1]]
+            held_days = di - pos["i"]
+            if strategy == "mean_reversion":
+                r = _bt_rsi(closes)
+                if (r is not None and r > 50) or held_days >= 5:
+                    pending_sell.add(sym)
+            else:
+                sm = _bt_sma(closes, 20)
+                if (sm is not None and closes[-1] < sm) or held_days >= max_hold_days:
+                    pending_sell.add(sym)
+        if not bull or day_pl <= -daily_loss or di < 55:
+            continue
+        cands = []
+        for sym, v in bars.items():
+            if sym == "SPY" or sym in held:
+                continue
+            j = idx[sym].get(d)
+            if j is None or j < 50:
+                continue
+            closes = [b["c"] for b in v[:j + 1]]
+            vols = [b["v"] for b in v[:j + 1]]
+            price = closes[-1]
+            if price < 5 or price > max_price:
+                continue
+            sm20, r = _bt_sma(closes, 20), _bt_rsi(closes)
+            if strategy == "mean_reversion":
+                sm50 = _bt_sma(closes, 50)
+                if r is not None and r < 30 and sm50 and price > sm50 * 0.9:
+                    cands.append((r, sym))
+            else:
+                av = _bt_sma(vols[:-1], 20)
+                sig = [price > sm20 if sm20 else False,
+                       r is not None and 40 <= r <= 70,
+                       bool(av) and vols[-1] > 1.2 * av]
+                n = sum(sig)
+                if n >= min_signals:
+                    cands.append((-n, sym))
+        cands.sort()
+        invested = sum(p["qty"] * p["entry"] for p in held.values())
+        slots = int(max(0, max_invested - invested) // max_position)
+        pending_buy = [sym for _, sym in cands[:slots]]
+    return {"equity": equity, "trades": trades, "spy": [(b["d"], b["c"]) for b in spy]}
+
+
+def summarize_backtest(res, split_frac=0.7):
+    """Full period plus in-sample / out-of-sample halves, using the scorecard math."""
+    eq, tr, spy = res["equity"], res["trades"], res["spy"]
+    def fills_for(trs):
+        f = []
+        for t in trs:
+            f.append({"symbol": t["symbol"], "side": "buy", "qty": t["qty"], "price": t["entry"], "time": t["entry_d"] + "T14:30:00Z"})
+            f.append({"symbol": t["symbol"], "side": "sell", "qty": t["qty"], "price": t["exit"], "time": t["exit_d"] + "T14:31:00Z"})
+        f.sort(key=lambda x: x["time"])
+        return f
+    out = {"full": compute_scorecard(eq, spy, fills_for(tr))}
+    if len(eq) > 40:
+        k = int(len(eq) * split_frac)
+        cut = eq[k - 1][0]
+        out["in_sample"] = compute_scorecard(eq[:k], spy, fills_for([t for t in tr if t["exit_d"] <= cut]))
+        out["out_of_sample"] = compute_scorecard(eq[k - 1:], spy, fills_for([t for t in tr if t["exit_d"] > cut]))
+        out["split_date"] = cut
+    return out
+
+
+_bt_cache = {"ts": 0, "bars": None}
+
+def _bt_load_bars(years=2):
+    if _bt_cache["bars"] and time.time() - _bt_cache["ts"] < 3600:
+        return _bt_cache["bars"]
+    start = (datetime.utcnow() - timedelta(days=int(365 * years) + 10)).strftime("%Y-%m-%dT00:00:00Z")
+    out = {}
+    for sym in sorted(set(MARKET_SCAN_LIST + ["SPY"])):
+        try:
+            r = requests.get(f"{ALPACA_DATA_URL}/stocks/{sym}/bars", headers=alpaca_hdrs(), timeout=20,
+                             params={"timeframe": "1Day", "start": start, "limit": 1000, "feed": "iex",
+                                     "adjustment": "split"})
+            if r.ok:
+                out[sym] = [{"d": b["t"][:10], "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b["v"]}
+                            for b in r.json().get("bars", [])]
+        except Exception as e:
+            logger.warning(f"backtest bars {sym}: {e}")
+    if out.get("SPY"):
+        _bt_cache["ts"], _bt_cache["bars"] = time.time(), out
+    return out
+
+
+@app.route("/api/backtest")
+@require_api_key
+def backtest_route():
+    """Read-only: replays technical rules on ~2 years of daily bars. Sends no orders."""
+    try:
+        bars = _bt_load_bars(2)
+        if not bars.get("SPY") or len(bars["SPY"]) < 100:
+            return jsonify({"error": "Not enough price history returned"}), 502
+        variants = [("Trend + momentum + volume (all 3 agree)", dict(strategy="technical", min_signals=3)),
+                    ("Trend + momentum + volume (2 of 3 agree)", dict(strategy="technical", min_signals=2)),
+                    ("Mean reversion (buy a sharp dip, sell the bounce)", dict(strategy="mean_reversion"))]
+        results = []
+        for name, kw in variants:
+            results.append({"name": name, "result": summarize_backtest(run_backtest(bars, **kw))})
+        return jsonify({"symbols": len([k for k in bars if k != "SPY"]), "days": len(bars["SPY"]), "variants": results,
+                        "notes": ["Technical rules only; sentiment and AI signals cannot be replayed on past data.",
+                                  "Orders fill at the next day's open with 0.05% slippage per side.",
+                                  "Ignores cash-account settlement delays, so real results would trade less often."]})
+    except Exception as e:
+        return _safe_err(e)
+
+
 @app.route("/api/news/<symbol>")
 def get_news(symbol):
     """Get latest news for a stock symbol"""

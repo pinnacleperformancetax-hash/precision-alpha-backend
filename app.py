@@ -3808,7 +3808,8 @@ def _bt_rsi(closes, n=14):
 
 def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_invested=250.0,
                  max_position=100.0, max_price=100.0, stop_pct=4.0, max_hold_days=10,
-                 daily_loss=10.0, slippage_pct=0.05, use_regime=True, regime_buffer_pct=0.0):
+                 daily_loss=10.0, slippage_pct=0.05, use_regime=True, regime_buffer_pct=0.0,
+                 breaker_pct=None, breaker_pause_days=10):
     """bars: {symbol: [{'d','o','h','l','c','v'}...]} oldest->newest; must include 'SPY'.
     Signals use data through the close of day t; orders fill at the open of day t+1.
     Returns {'equity': [(date, equity)], 'trades': [...], 'spy': [(date, close)]}. Pure function."""
@@ -3819,6 +3820,7 @@ def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_
     equity, trades, exposure = [], [], []
     slip = slippage_pct / 100.0
     prev_eq = capital
+    peak, halted_until, trips = float(capital), -1, 0
     for di, d in enumerate(dates):
         # 1. fills at today's open (orders queued yesterday)
         for sym in list(pending_sell):
@@ -3868,6 +3870,12 @@ def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_
         exposure.append((d, eq - cash))
         day_pl = eq - prev_eq
         prev_eq = eq
+        if breaker_pct and di >= halted_until:
+            peak = max(peak, eq)
+            if eq < peak * (1 - breaker_pct / 100.0):
+                trips += 1
+                halted_until = di + breaker_pause_days   # manual-reset stand-in: pause new buys
+                peak = eq
         # 4. signals at the close -> orders for tomorrow
         spy_closes = [b["c"] for b in spy[:di + 1]]
         sma_spy = _bt_sma(spy_closes, 20)
@@ -3889,7 +3897,7 @@ def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_
                 sm = _bt_sma(closes, 20)
                 if (sm is not None and closes[-1] < sm) or held_days >= max_hold_days:
                     pending_sell.add(sym)
-        if not bull or day_pl <= -daily_loss or di < 55:
+        if not bull or day_pl <= -daily_loss or di < 55 or di < halted_until:
             continue
         cands = []
         for sym, v in bars.items():
@@ -3920,7 +3928,8 @@ def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_
         invested = sum(p["qty"] * p["entry"] for p in held.values())
         slots = int(max(0, max_invested - invested) // max_position)
         pending_buy = [sym for _, sym in cands[:slots]]
-    return {"equity": equity, "trades": trades, "exposure": exposure, "spy": [(b["d"], b["c"]) for b in spy]}
+    return {"equity": equity, "trades": trades, "exposure": exposure, "breaker_trips": trips,
+            "spy": [(b["d"], b["c"]) for b in spy]}
 
 
 def summarize_backtest(res, split_frac=0.7):
@@ -3943,6 +3952,60 @@ def summarize_backtest(res, split_frac=0.7):
     return out
 
 
+def _fills_for_trades(trs):
+    f = []
+    for t in trs:
+        f.append({"symbol": t["symbol"], "side": "buy", "qty": t["qty"], "price": t["entry"], "time": t["entry_d"] + "T14:30:00Z"})
+        f.append({"symbol": t["symbol"], "side": "sell", "qty": t["qty"], "price": t["exit"], "time": t["exit_d"] + "T14:31:00Z"})
+    f.sort(key=lambda x: x["time"])
+    return f
+
+
+def slice_summaries(res, n=5, skip=60):
+    """Split the run (after the indicator warm-up) into n consecutive time slices and score each."""
+    eq, tr, spy, ex = res["equity"][skip:], res["trades"], res["spy"], res.get("exposure")
+    out, m = [], len(eq)
+    for i in range(n):
+        a, b = (i * (m - 1)) // n, ((i + 1) * (m - 1)) // n
+        seg = eq[a:b + 1]
+        if len(seg) < 3:
+            continue
+        d0, d1 = seg[0][0], seg[-1][0]
+        trs = [t for t in tr if d0 < t["exit_d"] <= d1]
+        sc = compute_scorecard(seg, spy, _fills_for_trades(trs), ex)
+        t = sc.get("trades", {})
+        out.append({"start": d0, "end": d1, "return_pct": sc.get("return_pct"),
+                    "spy_matched_pct": sc.get("spy_matched_pct"), "vs_spy_matched_pct": sc.get("vs_spy_matched_pct"),
+                    "max_drawdown_pct": sc.get("max_drawdown_pct"), "trades": t.get("closed_trades", 0),
+                    "profit_factor": t.get("profit_factor")})
+    return out
+
+
+def robustness_report(bars, label, **kw):
+    syms = sorted(k for k in bars if k != "SPY")
+    halves = {"A": syms[0::2], "B": syms[1::2]}
+    res = run_backtest(bars, **kw)
+    slices = slice_summaries(res)
+    full = compute_scorecard(res["equity"][60:], res["spy"], _fills_for_trades(res["trades"]), res.get("exposure"))
+    rep = {"name": label, "slices": slices, "breaker_trips": res.get("breaker_trips", 0),
+           "full": {k: full.get(k) for k in ("return_pct", "spy_matched_pct", "vs_spy_matched_pct", "max_drawdown_pct")},
+           "full_trades": full.get("trades", {}), "halves": {}}
+    for name, ss in halves.items():
+        sub = {k: bars[k] for k in ss}
+        sub["SPY"] = bars["SPY"]
+        r2 = run_backtest(sub, **kw)
+        sc = compute_scorecard(r2["equity"][60:], r2["spy"], _fills_for_trades(r2["trades"]), r2.get("exposure"))
+        rep["halves"][name] = {"stocks": len(ss), "return_pct": sc.get("return_pct"),
+                               "vs_spy_matched_pct": sc.get("vs_spy_matched_pct"),
+                               "profit_factor": sc.get("trades", {}).get("profit_factor"),
+                               "trades": sc.get("trades", {}).get("closed_trades", 0)}
+    pos = sum(1 for s_ in slices if (s_["return_pct"] or 0) > 0)
+    beat = sum(1 for s_ in slices if (s_["vs_spy_matched_pct"] or 0) > 0)
+    rep["summary"] = {"slices": len(slices), "positive_slices": pos, "beat_sp_slices": beat,
+                      "both_halves_positive": all((h["return_pct"] or 0) > 0 for h in rep["halves"].values())}
+    return rep
+
+
 _bt_cache = {"ts": 0, "bars": None}
 
 def _bt_load_bars(years=2):
@@ -3963,6 +4026,28 @@ def _bt_load_bars(years=2):
     if out.get("SPY"):
         _bt_cache["ts"], _bt_cache["bars"] = time.time(), out
     return out
+
+
+@app.route("/api/backtest/robust")
+@require_api_key
+def backtest_robust_route():
+    """Read-only stability test of the candidate rules: 5 time slices, 2 stock halves, 5% breaker."""
+    try:
+        bars = _bt_load_bars(2)
+        if not bars.get("SPY") or len(bars["SPY"]) < 150:
+            return jsonify({"error": "Not enough price history returned"}), 502
+        reports = [
+            robustness_report(bars, "2 of 3 signals agree · strict market filter", strategy="technical", min_signals=2),
+            robustness_report(bars, "2 of 3 signals agree · strict filter + 5% circuit breaker (pause new buys 10 trading days after a trip)",
+                              strategy="technical", min_signals=2, breaker_pct=5.0),
+            robustness_report(bars, "All 3 signals agree · strict market filter (for comparison)", strategy="technical", min_signals=3),
+        ]
+        return jsonify({"days": len(bars["SPY"]), "reports": reports,
+                        "notes": ["Time slices are consecutive and equal in length; a rule should be positive in most of them, not just overall.",
+                                  "Stock halves split the 24 stocks into two lists; a real rule should work on both.",
+                                  "Technical rules only; sentiment and AI cannot be replayed on past data."]})
+    except Exception as e:
+        return _safe_err(e)
 
 
 @app.route("/api/backtest")

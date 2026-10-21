@@ -811,6 +811,42 @@ def _minutes_to_close(est=None):
     close_h = 13 if _nyse_early_close(est.date()) else 16
     return (close_h * 60) - (est.hour * 60 + est.minute) - (est.second / 60.0)
 
+def _parse_cutoff_minutes(raw, default_minutes=12 * 60):
+    """'12:00' / '12' / '12:30' -> minutes after midnight (New York time).
+    'off' / '0' / 'none' / 'false' -> None (switched off). Blank/garbage -> default."""
+    v = str(raw if raw is not None else "").strip().lower()
+    if v == "":
+        return default_minutes
+    if v in ("off", "0", "none", "false", "no", "disabled"):
+        return None
+    try:
+        if ":" in v:
+            h, m = v.split(":", 1)
+            mins = int(h) * 60 + int(m)
+        else:
+            mins = int(float(v) * 60)
+        return mins if 0 < mins <= 24 * 60 else default_minutes
+    except Exception:
+        return default_minutes
+
+# The paper engine's own buys stop at this time (default noon New York time). Sells, stop-losses and
+# profit-taking keep running. Why: in 1,539 paper trades, buys after noon won ~29-37% (morning buys ~56%).
+# Switch off on Render with PAPER_NO_BUY_AFTER=off, or change the time, e.g. PAPER_NO_BUY_AFTER=13:30.
+PAPER_NO_BUY_AFTER_MIN = _parse_cutoff_minutes(os.environ.get("PAPER_NO_BUY_AFTER"))
+
+def _paper_buy_cutoff_passed(est=None, cutoff=None):
+    cutoff = PAPER_NO_BUY_AFTER_MIN if cutoff is None else cutoff
+    if cutoff is None:
+        return False
+    est = est or datetime.now(pytz.timezone('America/New_York'))
+    return (est.hour * 60 + est.minute) >= cutoff
+
+def _cutoff_label(mins):
+    if mins is None:
+        return None
+    h, m = divmod(int(mins), 60)
+    return f"{(h % 12) or 12}:{m:02d} {'AM' if h < 12 else 'PM'}"
+
 def reset_if_needed():
     today = datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d')
     changed = False
@@ -2177,6 +2213,10 @@ def auto_scan():
     if RULES['maxTrades'] < 999 and len(engine_state['weekly_trades']) >= RULES['maxTrades']:
         log_scan(f"🔴 Weekly trade limit reached ({len(engine_state['weekly_trades'])}/{int(RULES['maxTrades'])}) — no new buys"); return
 
+    no_buy_now = _paper_buy_cutoff_passed()
+    if no_buy_now:
+        log_scan(f"🕛 After {_cutoff_label(PAPER_NO_BUY_AFTER_MIN)} ET — no new buys (sells, stop-losses and profit-taking still run)")
+
     market_regime = get_market_regime()
     log_scan(f"📊 Market regime: {market_regime['label']}" + (
         f" (SPY ${market_regime['spy_price']} vs 20d SMA ${market_regime['spy_sma20']})"
@@ -2222,6 +2262,9 @@ def auto_scan():
             # held to the same bar as opening a new position — it still has
             # to clear the basic AI-quality check above, plus the "did we
             # actually hold shares" check below.
+            if side == 'buy' and no_buy_now:
+                _why_set(symbol, 'skip', f"No new buys after {_cutoff_label(PAPER_NO_BUY_AFTER_MIN)} ET. The engine only buys in the morning and early afternoon, because later buys have lost money on average.")
+                continue
             if side == 'buy':
                 required, out_of = confluence_threshold_for_regime(market_regime, symbol)
                 if required is None:
@@ -2748,6 +2791,7 @@ def engine_status():
         "trade_log": engine_state['trade_log'][:20],
         "customer_feed": engine_state['customer_feed'][:30],
         "is_market_hours": is_market_hours(),
+        "no_buy_after": _cutoff_label(PAPER_NO_BUY_AFTER_MIN),
         "ai_health": {"ok": ai_health['fails'] < 3, "kind": ai_health['kind'],
                       "message": ai_health['message'], "since": ai_health['since'],
                       "last_ok": ai_health['last_ok']},

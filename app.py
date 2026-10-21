@@ -59,6 +59,11 @@ def _safe_err(e):
     logger.error(f"{request.path}: {type(e).__name__}: {str(e)[:200]}")
     return jsonify({"error": "server error"}), 500
 
+# Input checks for values that get placed into outgoing Alpaca URLs.
+_SYMBOL_RE = re.compile(r'^[A-Za-z0-9.\-]{1,12}$')
+_CONTRACT_RE = re.compile(r'^[A-Za-z0-9\-]{1,40}$')       # OCC option symbol or Alpaca contract id
+_ISO_RE = re.compile(r'^[0-9TZ:.+\-]{0,40}$')              # ISO date/time text only
+
 @app.after_request
 def _security_headers(resp):
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -2846,8 +2851,16 @@ def manual_congress_scan():
 
 @app.route("/api/bars/<symbol>")
 def get_bars(symbol):
+    start, end = request.args.get('start', ''), request.args.get('end', '')
+    if not (_SYMBOL_RE.fullmatch(symbol) and _ISO_RE.fullmatch(start) and _ISO_RE.fullmatch(end)):
+        return jsonify({"error": "invalid input"}), 400
     try:
-        res = requests.get(f"{ALPACA_DATA_URL}/stocks/{symbol}/bars?timeframe=1Day&start={request.args.get('start','')}&end={request.args.get('end','')}&limit=5", headers=alpaca_hdrs(), timeout=10)
+        params = {'timeframe': '1Day', 'limit': 5}
+        if start:
+            params['start'] = start
+        if end:
+            params['end'] = end
+        res = requests.get(f"{ALPACA_DATA_URL}/stocks/{symbol}/bars", params=params, headers=alpaca_hdrs(), timeout=10)
         return jsonify(res.json()), res.status_code
     except Exception as e: return _safe_err(e)
 
@@ -2865,6 +2878,8 @@ def get_option_contracts(symbol):
     by the upcoming weekend, so the frontend should let the person pick a
     date range rather than relying on that default for anything useful.
     """
+    if not _SYMBOL_RE.fullmatch(symbol):
+        return jsonify({"error": "invalid symbol"}), 400
     try:
         params = {"underlying_symbols": symbol.upper()}
         passthrough = ['expiration_date', 'expiration_date_gte', 'expiration_date_lte',
@@ -2883,6 +2898,8 @@ def get_single_option_contract(contract_symbol):
     """Fetch one contract's full details by its OCC symbol (or Alpaca's
     internal contract id) — used once a specific strike/expiration is picked,
     to confirm it's tradable before building an order leg from it."""
+    if not _CONTRACT_RE.fullmatch(contract_symbol):
+        return jsonify({"error": "invalid contract"}), 400
     try:
         res = requests.get(f"{ALPACA_BASE_URL}/options/contracts/{contract_symbol}", headers=alpaca_hdrs(), timeout=10)
         return jsonify(res.json()), res.status_code
@@ -2895,6 +2912,8 @@ def get_option_live_quote(contract_symbol):
     display to price a single order or a spread's net debit/credit before
     you submit. Same v1beta1 snapshots endpoint the Edge Scanner uses,
     just for one symbol instead of a whole scan."""
+    if not _CONTRACT_RE.fullmatch(contract_symbol):
+        return jsonify({"error": "invalid contract"}), 400
     try:
         res = requests.get(f"{ALPACA_OPTIONS_DATA_URL}/options/snapshots",
                             headers=alpaca_hdrs(),
@@ -3249,7 +3268,14 @@ def orders():
                 })
                 save_state()
         else:
-            q = f"status={request.args.get('status','all')}&limit={request.args.get('limit','50')}"
+            status = request.args.get('status', 'all')
+            if status not in ('all', 'open', 'closed'):
+                status = 'all'
+            try:
+                limit = max(1, min(500, int(request.args.get('limit', '50'))))
+            except ValueError:
+                limit = 50
+            q = f"status={status}&limit={limit}"
             after = request.args.get('after', '')
             if after and re.fullmatch(r'[0-9TZ:.+-]{8,40}', after):  # ISO timestamp only
                 q += f"&after={after}"
@@ -3261,20 +3287,28 @@ def orders():
 @require_api_key
 def ai_analyze():
     try:
-        data = request.get_json()
+        data = request.get_json() or {}
+        try:
+            max_tokens = max(1, min(1000, int(data.get("max_tokens", 500))))
+        except (TypeError, ValueError):
+            max_tokens = 500
+        prompt = str(data.get("prompt", ""))[:8000]
         res = requests.post("https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
-            json={"model": "claude-haiku-4-5-20251001", "max_tokens": data.get("max_tokens", 500), "messages": [{"role": "user", "content": data.get("prompt", "")}]},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]},
             timeout=25)
         return jsonify(res.json()), res.status_code
     except Exception as e: return _safe_err(e)
 
 
 
+_ledger_force_ts = {'t': 0.0}
+
 @app.route("/api/profit/ledger")
 def profit_ledger():
     """Banked (realized) profit kept separate from money still at risk."""
-    if request.args.get('sync'):
+    if request.args.get('sync') and time.time() - _ledger_force_ts['t'] >= 30:   # at most one forced resync per 30 s
+        _ledger_force_ts['t'] = time.time()
         _reset_ledger_lock()  # ?sync=1: force a fresh sync, even if a lock is stuck
         sync_ledger_from_fills(force=True)
     sweep_vault_if_due()
@@ -4177,9 +4211,12 @@ def backtest_route():
 @app.route("/api/news/<symbol>")
 def get_news(symbol):
     """Get latest news for a stock symbol"""
+    if not _SYMBOL_RE.fullmatch(symbol):
+        return jsonify({"error": "invalid symbol"}), 400
     try:
         res = requests.get(
-            f"https://data.alpaca.markets/v1beta1/news?symbols={symbol}&limit=5",
+            "https://data.alpaca.markets/v1beta1/news",
+            params={"symbols": symbol, "limit": 5},
             headers=alpaca_hdrs(), timeout=10
         )
         if res.ok:

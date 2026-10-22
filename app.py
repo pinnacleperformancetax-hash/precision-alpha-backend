@@ -3709,7 +3709,22 @@ def get_trade_history():
 # Track-record scorecard (paper account): the evidence a funded program,
 # a lawyer, or you would want before any real scaling. Read-only.
 # ---------------------------------------------------------------------------
-def compute_scorecard(equity_pts, spy_pts, fills, exposure_pts=None):
+def _source_of_symbol(sym):
+    """Label a stock by the engine that trades it. Matched by stock, not by order:
+    a stock on the Auto Engine's 25-stock scan list counts as Auto Engine; a stock the
+    congressional copy engine has bought (and the scan list doesn't hold) counts as
+    Congress copy; anything else is Other / manual."""
+    try:
+        if sym in MARKET_SCAN_LIST:
+            return "Auto Engine"
+        cong = {str(k).split("_", 1)[1] for k in congress_state.get("copied_trades", []) if "_" in str(k)}
+        if sym in cong:
+            return "Congress copy"
+    except Exception:
+        pass
+    return "Other / manual"
+
+def compute_scorecard(equity_pts, spy_pts, fills, exposure_pts=None, source_of=None):
     """equity_pts: [(date_str, equity)] oldest->newest. spy_pts: [(date_str, close)].
     fills: [{'symbol','side','qty','price','time'(ISO)}] oldest->newest.
     Pure function (no network) so it can be tested."""
@@ -3833,11 +3848,31 @@ def compute_scorecard(equity_pts, spy_pts, fills, exposure_pts=None):
         def _rows(store, order):
             return [{"bucket": k, "trades": store[k][0], "pl": round(store[k][1], 2),
                      "win_rate_pct": round(100.0 * store[k][2] / store[k][0], 1)} for k in order if k in store]
+        # Which engine's stocks made / lost the money (matched by stock; see _source_of_symbol).
+        by_src = {}
+        if source_of:
+            for c in closed:
+                try:
+                    k = source_of(c["symbol"])
+                except Exception:
+                    k = "Other / manual"
+                r = by_src.setdefault(k, {"trades": 0, "pl": 0.0, "wins": 0, "gain": 0.0, "loss": 0.0})
+                r["trades"] += 1; r["pl"] += c["pl"]
+                if c["pl"] > 0:
+                    r["wins"] += 1; r["gain"] += c["pl"]
+                else:
+                    r["loss"] += -c["pl"]
+        src_rows = [{"bucket": k, "trades": v["trades"], "pl": round(v["pl"], 2),
+                     "win_rate_pct": round(100.0 * v["wins"] / v["trades"], 1),
+                     "profit_factor": (round(v["gain"] / v["loss"], 2) if v["loss"] > 0 else None),
+                     "avg_per_trade": round(v["pl"] / v["trades"], 2)} for k, v in by_src.items() if v["trades"]]
+        src_rows.sort(key=lambda r: -r["trades"])
         ranked = sorted(bysym.items(), key=lambda kv: kv[1])
         notional = sum(c["notional"] for c in closed)
         tot = sum(c["pl"] for c in closed)
         t["breakdown"] = {
             "by_hold": _rows(hb, order_h), "by_entry_time": _rows(eb, order_e),
+            "by_source": src_rows,
             "best_symbols": [[k, round(v, 2)] for k, v in ranked[::-1][:5]],
             "worst_symbols": [[k, round(v, 2)] for k, v in ranked[:5]],
             "after_costs": [{"bps": bp, "net": round(tot - notional * 2 * bp / 10000.0, 2)} for bp in (0, 5, 10, 20)],
@@ -3927,7 +3962,7 @@ def scorecard():
                 break
             after = batch[-1].get("submitted_at")
         fills.sort(key=lambda f: f["time"])
-        return jsonify(compute_scorecard(eq_pts, spy_pts, fills, exposure_from_fills(fills, [d for d, _ in eq_pts])))
+        return jsonify(compute_scorecard(eq_pts, spy_pts, fills, exposure_from_fills(fills, [d for d, _ in eq_pts]), source_of=_source_of_symbol))
     except Exception as e:
         return _safe_err(e)
 

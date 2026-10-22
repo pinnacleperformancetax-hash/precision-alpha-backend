@@ -2309,6 +2309,12 @@ def auto_scan():
                 if left > 0:
                     log_scan(f"⏳ {symbol} — SELL signal ignored: bought it recently, cooldown {left:.0f} more min (stop-loss still active)")
                     continue
+                # Same-direction spacing: after ANY sell of this stock (AI sell, stop or
+                # profit-taking), wait out the cooldown before another AI sell of it.
+                left = cooldown_left(symbol, 'sell')
+                if left > 0:
+                    log_scan(f"⏳ {symbol} — SELL signal ignored: sold it recently, cooldown {left:.0f} more min (stop-loss still active)")
+                    continue
                 current_qty = held
             else:
                 current_qty = max(held, 0) + pending_buy  # effective exposure incl. queued orders
@@ -2321,6 +2327,12 @@ def auto_scan():
                 left = cooldown_left(symbol, 'sell')
                 if left > 0:
                     log_scan(f"⏳ {symbol} — BUY signal ignored: sold it recently, cooldown {left:.0f} more min")
+                    continue
+                # Same-direction spacing: after buying this stock, wait out the cooldown
+                # before adding another share of it (no stacking within minutes).
+                left = cooldown_left(symbol, 'buy')
+                if left > 0:
+                    log_scan(f"⏳ {symbol} — BUY signal ignored: bought it recently, cooldown {left:.0f} more min")
                     continue
                 # Per-stock daily loss: this ONE stock is down too much today,
                 # so no more buys of it until tomorrow. Other stocks carry on.
@@ -4622,6 +4634,8 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                     continue
                 if _cust_cooldown_left(st, sym, "sell", r["cooldownMinutes"]) > 0:
                     continue
+                if _cust_cooldown_left(st, sym, "buy", r["cooldownMinutes"]) > 0:
+                    continue          # just bought this one: no stacking more shares within the cooldown
                 if sym in positions and r.get("maxDailyLossPerStock"):
                     if float(positions[sym].get("unrealized_intraday_pl", 0) or 0) <= -r["maxDailyLossPerStock"]:
                         continue
@@ -4655,6 +4669,8 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                     continue
                 if _cust_cooldown_left(st, sym, "buy", r["cooldownMinutes"]) > 0:
                     continue
+                if _cust_cooldown_left(st, sym, "sell", r["cooldownMinutes"]) > 0:
+                    continue          # just sold this one: no dumping the rest within the cooldown
                 if caps and _cust_cooldown_left(st, sym, "buy", LIVE_MIN_HOLD_MINUTES) > 0:
                     continue          # live account: hold a while before an AI sell signal can close it
             if not is_market_hours():

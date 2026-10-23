@@ -3830,7 +3830,23 @@ def compute_scorecard(equity_pts, spy_pts, fills, exposure_pts=None, source_of=N
                     else "2:00 to 3:00" if m < 900 else "after 3:00")
         order_e = ["before 10:30", "10:30 to 12:00", "12:00 to 2:00", "2:00 to 3:00", "after 3:00"]
         hb, eb, bysym = {}, {}, {}
+        mx, ovn, wkd = {}, {}, {}
+        _wk = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         for c in closed:
+            try:
+                _a = datetime.fromisoformat(c["t_in"].replace("Z", "+00:00"))
+                _b = datetime.fromisoformat(c["t_out"].replace("Z", "+00:00"))
+                _a = _a.astimezone(_ny) if _ny else _a - timedelta(hours=5)
+                _b = _b.astimezone(_ny) if _ny else _b - timedelta(hours=5)
+                _hk = _hb((_b - _a).total_seconds() / 60.0)
+                _ek = _eb(c["t_in"])
+                if _ek:
+                    r = mx.setdefault((_hk, _ek), [0, 0.0, 0]); r[0] += 1; r[1] += c["pl"]; r[2] += 1 if c["pl"] > 0 else 0
+                _ok = "same day" if _a.date() == _b.date() else "held overnight or longer"
+                r = ovn.setdefault(_ok, [0, 0.0, 0]); r[0] += 1; r[1] += c["pl"]; r[2] += 1 if c["pl"] > 0 else 0
+                r = wkd.setdefault(_wk[_a.weekday()], [0, 0.0, 0]); r[0] += 1; r[1] += c["pl"]; r[2] += 1 if c["pl"] > 0 else 0
+            except Exception:
+                pass
             try:
                 a = datetime.fromisoformat(c["t_in"].replace("Z", "+00:00"))
                 b2 = datetime.fromisoformat(c["t_out"].replace("Z", "+00:00"))
@@ -3873,6 +3889,11 @@ def compute_scorecard(equity_pts, spy_pts, fills, exposure_pts=None, source_of=N
         t["breakdown"] = {
             "by_hold": _rows(hb, order_h), "by_entry_time": _rows(eb, order_e),
             "by_source": src_rows,
+            "hold_by_entry": [{"hold": h2, "entry": e2, "trades": v[0], "pl": round(v[1], 2),
+                               "win_rate_pct": round(100.0 * v[2] / v[0], 1)}
+                              for (h2, e2), v in sorted(mx.items(), key=lambda kv: (order_h.index(kv[0][0]), order_e.index(kv[0][1])))],
+            "same_day_vs_overnight": _rows(ovn, ["same day", "held overnight or longer"]),
+            "by_weekday": _rows(wkd, [d for d in _wk if d in wkd]),
             "best_symbols": [[k, round(v, 2)] for k, v in ranked[::-1][:5]],
             "worst_symbols": [[k, round(v, 2)] for k, v in ranked[:5]],
             "after_costs": [{"bps": bp, "net": round(tot - notional * 2 * bp / 10000.0, 2)} for bp in (0, 5, 10, 20)],

@@ -3968,6 +3968,83 @@ def scorecard():
 
 
 # ---------------------------------------------------------------------------
+# Prop-firm challenge simulator (read-only). Replays the paper account's daily
+# results against typical funded-trader challenge rules: a profit target, a daily
+# loss limit, a maximum loss from the starting balance, a minimum number of
+# trading days and a time limit. Every possible start day is tried. Daily closes
+# only, so intraday swings that a real firm would catch are not seen.
+def compute_propsim(eq_pts, target_pct=8.0, daily_pct=5.0, dd_pct=10.0, max_days=30, min_days=4,
+                    mults=(1, 5, 10, 20, 40)):
+    pts = [(d, float(e)) for d, e in eq_pts if e]
+    if len(pts) < 5:
+        return {"error": "Not enough history yet"}
+    dates = [datetime.strptime(d, "%Y-%m-%d") for d, _ in pts]
+    rets = [None] + [pts[i][1] / pts[i - 1][1] - 1.0 for i in range(1, len(pts))]
+    out = {"params": {"target_pct": target_pct, "daily_loss_pct": daily_pct, "max_loss_pct": dd_pct,
+                      "time_limit_days": max_days, "min_trading_days": min_days},
+           "history_days": len(pts), "start_date": pts[0][0], "end_date": pts[-1][0], "scenarios": []}
+    for k in mults:
+        res = {"size": k, "windows": 0, "passed": 0, "failed_daily": 0, "failed_max_loss": 0, "timed_out": 0,
+               "best_return_pct": None, "worst_return_pct": None, "days_to_pass": []}
+        for s0 in range(0, len(pts) - 1):
+            if (dates[-1] - dates[s0]).days < max_days:
+                break
+            bal, tdays, outcome, end_bal = 1.0, 0, None, 1.0
+            for j in range(s0 + 1, len(pts)):
+                if (dates[j] - dates[s0]).days > max_days:
+                    break
+                r = k * rets[j]
+                bal *= (1.0 + r)
+                tdays += 1
+                end_bal = bal
+                if r <= -daily_pct / 100.0:
+                    outcome = "failed_daily"; break
+                if bal <= 1.0 - dd_pct / 100.0:
+                    outcome = "failed_max_loss"; break
+                if bal >= 1.0 + target_pct / 100.0 and tdays >= min_days:
+                    outcome = "passed"; res["days_to_pass"].append((dates[j] - dates[s0]).days); break
+            res["windows"] += 1
+            res[outcome or "timed_out"] += 1
+            ret = (end_bal - 1.0) * 100.0
+            res["best_return_pct"] = ret if res["best_return_pct"] is None else max(res["best_return_pct"], ret)
+            res["worst_return_pct"] = ret if res["worst_return_pct"] is None else min(res["worst_return_pct"], ret)
+        w = res["windows"]
+        res["pass_rate_pct"] = round(100.0 * res["passed"] / w, 1) if w else None
+        res["avg_days_to_pass"] = round(sum(res["days_to_pass"]) / len(res["days_to_pass"]), 1) if res["days_to_pass"] else None
+        del res["days_to_pass"]
+        for key in ("best_return_pct", "worst_return_pct"):
+            if res[key] is not None:
+                res[key] = round(res[key], 2)
+        out["scenarios"].append(res)
+    return out
+
+@app.route("/api/propsim")
+@require_api_key
+def propsim():
+    """Would the paper account have passed a typical funded-trader challenge?"""
+    try:
+        def _f(name, default, lo, hi):
+            try:
+                v = float(request.args.get(name, default))
+            except Exception:
+                v = default
+            return max(lo, min(hi, v))
+        r = requests.get(f"{ALPACA_BASE_URL}/account/portfolio/history", headers=alpaca_hdrs(),
+                         params={"period": "1A", "timeframe": "1D"}, timeout=15)
+        if not r.ok:
+            return jsonify({"error": "Could not read account history"}), 502
+        h = r.json()
+        eq_pts = []
+        for ts, e in zip(h.get("timestamp") or [], h.get("equity") or []):
+            if e:
+                eq_pts.append((datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d"), e))
+        return jsonify(compute_propsim(eq_pts, target_pct=_f("target", 8, 1, 50), daily_pct=_f("daily", 5, 0.5, 20),
+                                       dd_pct=_f("maxloss", 10, 1, 50), max_days=int(_f("days", 30, 5, 180)),
+                                       min_days=int(_f("mindays", 4, 0, 30))))
+    except Exception as e:
+        return _safe_err(e)
+
+# ---------------------------------------------------------------------------
 # Backtester (read-only; sends no orders). Replays the TECHNICAL rules on
 # daily bars. Sentiment and AI signals cannot be replayed historically, so
 # they are not included -- results show what the chart-based rules alone do.

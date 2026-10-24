@@ -4084,7 +4084,7 @@ def _bt_rsi(closes, n=14):
 def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_invested=250.0,
                  max_position=100.0, max_price=100.0, stop_pct=4.0, max_hold_days=10,
                  daily_loss=10.0, slippage_pct=0.05, use_regime=True, regime_buffer_pct=0.0,
-                 breaker_pct=None, breaker_pause_days=10):
+                 breaker_pct=None, breaker_pause_days=10, min_hold_days=0):
     """bars: {symbol: [{'d','o','h','l','c','v'}...]} oldest->newest; must include 'SPY'.
     Signals use data through the close of day t; orders fill at the open of day t+1.
     Returns {'equity': [(date, equity)], 'trades': [...], 'spy': [(date, close)]}. Pure function."""
@@ -4170,7 +4170,8 @@ def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_
                     pending_sell.add(sym)
             else:
                 sm = _bt_sma(closes, 20)
-                if (sm is not None and closes[-1] < sm) or held_days >= max_hold_days:
+                # swing style: the trend-break exit only counts after min_hold_days (stop-loss still works any day)
+                if (sm is not None and closes[-1] < sm and held_days >= min_hold_days) or held_days >= max_hold_days:
                     pending_sell.add(sym)
         if not bull or day_pl <= -daily_loss or di < 55 or di < halted_until:
             continue
@@ -4321,6 +4322,30 @@ def backtest_robust_route():
                         "notes": ["Time slices are consecutive and equal in length; a rule should be positive in most of them, not just overall.",
                                   "Stock halves split the 24 stocks into two lists; a real rule should work on both.",
                                   "Technical rules only; sentiment and AI cannot be replayed on past data."]})
+    except Exception as e:
+        return _safe_err(e)
+
+
+@app.route("/api/backtest/swing")
+@require_api_key
+def backtest_swing_route():
+    """Read-only: does holding longer (swing style) beat the current exits? Same stability tests as /robust."""
+    try:
+        bars = _bt_load_bars(2)
+        if not bars.get("SPY") or len(bars["SPY"]) < 150:
+            return jsonify({"error": "Not enough price history returned"}), 502
+        reports = [
+            robustness_report(bars, "Current style: 2 of 3 signals · strict filter · sells on a trend break any day (max 10 days)",
+                              strategy="technical", min_signals=2),
+            robustness_report(bars, "Swing style A: same buys, but no trend-break sell before 3 days (stop-loss still active, max 10 days)",
+                              strategy="technical", min_signals=2, min_hold_days=3),
+            robustness_report(bars, "Swing style B: same buys, no trend-break sell before 5 days, up to 20 days",
+                              strategy="technical", min_signals=2, min_hold_days=5, max_hold_days=20),
+        ]
+        return jsonify({"days": len(bars["SPY"]), "reports": reports,
+                        "notes": ["Swing styles keep the same buy rules and the same 4% stop-loss; only the sell timing changes.",
+                                  "Technical rules only; sentiment and AI sells cannot be replayed on past data, and the live engine's AI sells are what cut many trades short.",
+                                  "Orders fill at the next day's open with 0.05% slippage per side; cash-account settlement delays are ignored."]})
     except Exception as e:
         return _safe_err(e)
 

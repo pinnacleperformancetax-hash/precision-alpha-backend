@@ -2720,6 +2720,20 @@ def congress_scan():
                 log_congress(f"⛔ {ticker} — trading-account cap: {blocked}")
                 continue
 
+            # Last-second recheck: re-read holdings + open orders right before
+            # sending, and shrink or skip so the final total can never pass the cap.
+            _ex2 = get_exposure(ticker)
+            if _ex2 is None:
+                log_congress(f"⏭ {ticker} — couldn't re-verify position right before ordering, skipping")
+                continue
+            _held2, _pend2, _ = _ex2
+            _room2 = cap - (_held2 + _pend2)
+            if _room2 <= 0:
+                log_congress(f"⏭ {ticker} — recheck: already {_held2 + _pend2}/{cap}, skipping")
+                continue
+            qty = min(qty, _room2)
+            log_congress(f"🔎 CAP AUDIT {ticker}: held {_held2}, pending {_pend2}, cap {cap}, buying {qty} → {_held2 + _pend2 + qty}/{cap}")
+
             or_ = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(),
                 json={"symbol": ticker, "qty": str(qty), "side": "buy", "type": "market", "time_in_force": "day"}, timeout=10)
 
@@ -3272,6 +3286,11 @@ def orders():
             reset_if_needed()
             if side == 'buy' and RULES['maxTrades'] < 999 and len(engine_state['weekly_trades']) >= RULES['maxTrades']:
                 return jsonify({"message": f"Weekly trade limit reached ({len(engine_state['weekly_trades'])}/{int(RULES['maxTrades'])})"}), 429
+            if side == 'buy' and str(order_data.get('symbol', '')).isalpha():
+                try:
+                    log_scan(f"🔎 MANUAL BUY from Trade page: {order_data.get('qty')} {order_data.get('symbol')}")
+                except Exception:
+                    pass
             res = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(), json=order_data, timeout=10)
             if res.ok and side == 'buy':
                 engine_state['weekly_trades'].append({

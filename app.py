@@ -4800,6 +4800,11 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                 if limit_hit:
                     continue
                 required, out_of = _cust_conf_required(regime, offset)
+                bear_test = False
+                if required is None and caps and LIVE_BEAR_TEST:
+                    # test mode: use the normal-market bar, but with the tiny size limits applied below
+                    required, out_of = _cust_conf_required({"trend": "bull", "volatility": "normal"}, offset)
+                    bear_test = True
                 if required is None:
                     continue
                 signals_all = list(sig["base"]) + [("ai", True)]  # side/conf/vol/sync already cleared above with THIS customer's rules
@@ -4833,6 +4838,12 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                     invested += sum(q * (signals.get(s2, {}).get("price", 0)) for s2, q in pend_buy.items())
                     if invested + price > caps["max_invested"]:
                         continue
+                    if bear_test:
+                        if cur >= 1 or invested + price > LIVE_BEAR_MAX_INVESTED:
+                            continue
+                        if st.get("bear_logged_day") != today:
+                            st["bear_logged_day"] = today
+                            _cust_log(st, pre + f"🧪 Bear-market TEST MODE: market is trending down, but test buys are allowed (1 share per stock, up to ${LIVE_BEAR_MAX_INVESTED:g} invested).")
                     # small-account day-trade guard (margin accounts under $25k): stop buying before the limit
                     try:
                         if float(acct.get("multiplier", 1) or 1) > 1 and equity < 25000 and int(acct.get("daytrade_count", 0) or 0) >= 2:
@@ -5017,6 +5028,11 @@ try:
     LIVE_NO_BUY_LAST_MINUTES = max(0.0, float(os.environ.get("LIVE_NO_BUY_LAST_MINUTES", "").strip() or 60))
 except Exception:
     LIVE_NO_BUY_LAST_MINUTES = 60.0
+# Bear-market test mode (OFF by default): lets the LIVE account buy while the S&P is below its 20-day average,
+# but only 1 share per stock and no more than LIVE_BEAR_MAX_INVESTED dollars invested in total. Meant for a short
+# real-order plumbing test. Turn on with LIVE_BEAR_TEST=1 in Render; remove it (or set 0) to turn it off.
+LIVE_BEAR_TEST = os.environ.get("LIVE_BEAR_TEST", "").strip() == "1"
+LIVE_BEAR_MAX_INVESTED = _live_num("LIVE_BEAR_MAX_INVESTED", 100)
 LIVE_RISK = os.environ.get("LIVE_RISK_LEVEL", "balanced").strip().lower()
 if LIVE_RISK not in RISK_PROFILES:
     LIVE_RISK = "balanced"

@@ -4830,6 +4830,8 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                     # carried overnight into a gap. Stops, profit-taking and AI sells keep working.
                     if LIVE_NO_BUY_LAST_MINUTES > 0 and _minutes_to_close() < LIVE_NO_BUY_LAST_MINUTES:
                         continue
+                    if LIVE_NO_BUY_AFTER_MIN is not None and _paper_buy_cutoff_passed(cutoff=LIVE_NO_BUY_AFTER_MIN):
+                        continue          # live account: same noon cutoff as paper (afternoon buys have lost money)
                     if price > caps["max_price"]:
                         continue
                     if (cur + 1) * price > caps["max_position"]:
@@ -5033,6 +5035,9 @@ except Exception:
 # real-order plumbing test. Turn on with LIVE_BEAR_TEST=1 in Render; remove it (or set 0) to turn it off.
 LIVE_BEAR_TEST = os.environ.get("LIVE_BEAR_TEST", "").strip() == "1"
 LIVE_BEAR_MAX_INVESTED = _live_num("LIVE_BEAR_MAX_INVESTED", 100)
+# Live account noon cutoff: same rule as the paper engine (no NEW buys after this time, New York time; default
+# 12:00 PM). Stops, profit-taking and AI sells keep running. Off with LIVE_NO_BUY_AFTER=off, or e.g. 13:30.
+LIVE_NO_BUY_AFTER_MIN = _parse_cutoff_minutes(os.environ.get("LIVE_NO_BUY_AFTER"))
 LIVE_RISK = os.environ.get("LIVE_RISK_LEVEL", "balanced").strip().lower()
 if LIVE_RISK not in RISK_PROFILES:
     LIVE_RISK = "balanced"
@@ -5083,7 +5088,7 @@ def live_engine_loop():
 def live_status():
     out = {"enabled": LIVE_ENGINE_ENABLED, "keys_set": bool(LIVE_KEY and LIVE_SECRET), "practice_mode": LIVE_DRY_RUN,
            "paused": live_engine["paused"], "risk_level": LIVE_RISK, "caps": LIVE_CAPS, "min_hold_minutes": LIVE_MIN_HOLD_MINUTES,
-           "no_buy_last_minutes": LIVE_NO_BUY_LAST_MINUTES,
+           "no_buy_last_minutes": LIVE_NO_BUY_LAST_MINUTES, "no_buy_after": _cutoff_label(LIVE_NO_BUY_AFTER_MIN),
            "last_cycle": live_engine["last_cycle"], "last_error": live_engine["last_error"]}
     if _live_ready():
         try:

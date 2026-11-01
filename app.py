@@ -162,6 +162,7 @@ congress_state = {
 # multi-tenant rebuild happens.
 STATE_FILE = os.environ.get("STATE_FILE_PATH", "/tmp/precision_alpha_state.json")
 _state_lock = threading.Lock()
+seedsim_state = {'sims': {}}   # Seed-sized pretend accounts (calm / focused); saved with the rest of the state
 
 # ---- Durable copy in Supabase (survives deploys) ----
 # The local file above is wiped by every deploy. If SUPABASE_URL and
@@ -232,7 +233,7 @@ def _remote_writer():
             continue
         try:
             with _state_lock:
-                payload = {'engine_state': engine_state, 'congress_state': congress_state, '_saved_at': time.time()}
+                payload = {'engine_state': engine_state, 'congress_state': congress_state, 'seedsim_state': seedsim_state, '_saved_at': time.time()}
                 body = json.dumps({'id': SUPABASE_ROW, 'data': payload,
                                    'updated_at': datetime.utcnow().isoformat() + 'Z'})
             r = requests.post(f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}",
@@ -571,7 +572,7 @@ def save_state():
         with _state_lock:
             with open(STATE_FILE, 'w') as f:
                 json.dump({'engine_state': engine_state, 'congress_state': congress_state,
-                           '_saved_at': time.time()}, f)
+                           'seedsim_state': seedsim_state, '_saved_at': time.time()}, f)
     except Exception as e:
         logger.error(f"Failed to save state: {e}")
     _remote_kick()
@@ -693,6 +694,7 @@ def load_state():
     try:
         engine_state.update(data.get('engine_state', {}))
         congress_state.update(data.get('congress_state', {}))
+        seedsim_state.update(data.get('seedsim_state', {}) or {})
         _remote['loaded_from'] = src
         logger.info(f"✅ Restored state from {src} — congress copied_trades: {len(congress_state.get('copied_trades', []))}, engine running: {engine_state.get('running')}")
     except Exception as e:
@@ -5137,6 +5139,245 @@ def live_breaker_reset():
     return jsonify({"ok": True})
 
 # ---- Background threads: engine, Congress engine, weekly email ----
+# ===========================================================================
+# Seed sim: pretend $300 accounts (no orders, no real money, no Alpaca account involved).
+# Purpose: find out whether a very small account can grow instead of hovering ("dangling").
+# Two styles run side by side on the SAME signals as the live and paper engines:
+#   calm    = many small positions, 4% stop (the baseline)
+#   focused = one or two bigger positions, 2% stop, bigger profit targets
+# Fractional shares are allowed (that is how a real Seed user would buy). All limits are
+# percentages of the starting amount, so they scale if SEEDSIM_START changes.
+# Turn off with SEEDSIM=0 in Render; change the start amount with SEEDSIM_START (default 300).
+# ===========================================================================
+import copy as _copy
+SEEDSIM_ENABLED = os.environ.get("SEEDSIM", "1").strip() != "0"
+SEEDSIM_START = _live_num("SEEDSIM_START", 300)
+SEEDSIM_MIN_HOLD_MINUTES = 120      # same as the live account: no AI sell for 2 hours after a buy
+SEEDSIM_COOLDOWN_MINUTES = 30       # same spacing as the other engines
+SEEDSIM_NO_BUY_LAST_MINUTES = 60    # same near-close cutoff as live
+SEEDSIM_DANGLE_DAYS = 30            # judged after this many trading days
+SEEDSIM_DANGLE_BAND_PCT = 2.0       # "dangling" = never left +/-2% of the start in that time
+SEEDSIM_CONFIGS = {
+    "calm": {"label": "Calm", "max_invested": 0.50, "max_position": 0.17, "chunk": 0.083, "max_positions": 6,
+             "stop_pct": 4.0, "tiers": [(5.0, 0.34), (10.0, 0.33)], "final_pct": 15.0, "daily_loss": 0.02},
+    "focused": {"label": "Focused", "max_invested": 0.90, "max_position": 0.50, "chunk": 0.25, "max_positions": 2,
+                "stop_pct": 2.0, "tiers": [(6.0, 0.50)], "final_pct": 12.0, "daily_loss": 0.033},
+}
+
+def _seed_new_sim(key, today):
+    st = float(SEEDSIM_START)
+    return {"key": key, "start": st, "cash": st, "pos": {}, "realized": 0.0, "wins": 0, "losses": 0,
+            "gross_win": 0.0, "gross_loss": 0.0, "trades": 0, "started": today, "day": None, "day_start": None,
+            "history": [], "cooldowns": {}, "feed": [], "peak": st, "max_dd_pct": 0.0, "last_eq": st,
+            "limit_logged": False}
+
+def _seed_log(sim, est, msg):
+    sim["feed"].insert(0, f"{est.strftime('%m-%d %I:%M %p')} · {msg}")
+    sim["feed"] = sim["feed"][:25]
+
+def _seed_cool_left(sim, sym, side, mins, now_ts):
+    t = (sim["cooldowns"].get(sym) or {}).get(side)
+    if not t:
+        return 0.0
+    left = mins - (now_ts - t) / 60.0
+    return left if left > 0 else 0.0
+
+def _seed_equity(sim):
+    return round(sim["cash"] + sum(p["qty"] * p.get("last", p["avg"]) for p in sim["pos"].values()), 2)
+
+def _seed_sell(sim, sym, qty, price, est, now_ts, why):
+    p = sim["pos"].get(sym)
+    if not p or qty <= 0 or price <= 0:
+        return
+    qty = min(qty, p["qty"])
+    pl = (price - p["avg"]) * qty
+    sim["cash"] = round(sim["cash"] + qty * price, 4)
+    sim["realized"] = round(sim["realized"] + pl, 4)
+    sim["trades"] += 1
+    if pl >= 0:
+        sim["wins"] += 1; sim["gross_win"] += pl
+    else:
+        sim["losses"] += 1; sim["gross_loss"] += -pl
+    p["qty"] = round(p["qty"] - qty, 6)
+    sim["cooldowns"].setdefault(sym, {})["sell"] = now_ts
+    _seed_log(sim, est, f"🔴 Sold {qty:.4f} {sym} at about ${price:.2f} ({why}). {'+' if pl >= 0 else '-'}${abs(pl):.2f}")
+    if p["qty"] * price < 0.5:        # leftover dust: close it
+        sim["cash"] = round(sim["cash"] + p["qty"] * price, 4)
+        sim["pos"].pop(sym, None)
+
+def _seed_buy(sim, sym, dollars, price, est, now_ts, agreeing, total):
+    qty = round(dollars / price, 6)
+    if qty <= 0:
+        return
+    p = sim["pos"].get(sym) or {"qty": 0.0, "avg": 0.0, "last": price, "bought_at": now_ts, "origin": 0.0, "tiers": []}
+    tot = p["qty"] + qty
+    p["avg"] = round((p["qty"] * p["avg"] + qty * price) / tot, 6)
+    p["qty"], p["last"], p["bought_at"] = round(tot, 6), price, now_ts
+    if p["qty"] > p.get("origin", 0.0):
+        p["origin"], p["tiers"] = p["qty"], []
+    sim["pos"][sym] = p
+    sim["cash"] = round(sim["cash"] - qty * price, 4)
+    sim["cooldowns"].setdefault(sym, {})["buy"] = now_ts
+    _seed_log(sim, est, f"🟢 Bought ${dollars:.2f} of {sym} ({qty:.4f} shares at about ${price:.2f}). {agreeing} of {total} signals agreed.")
+
+def seedsim_run_cycle(sim, cfg, signals, regime, est, mtc, cutoff_passed, now_ts=None):
+    """One pass for one pretend account. Mutates and returns sim."""
+    now_ts = now_ts if now_ts is not None else time.time()
+    today = est.strftime("%Y-%m-%d")
+    st = sim["start"]
+    for sym, p in sim["pos"].items():                      # mark to market
+        px = float((signals.get(sym) or {}).get("price") or 0)
+        if px > 0:
+            p["last"] = px
+    eq = _seed_equity(sim)
+    if sim["day"] != today:                                # new trading day
+        if sim["day"]:
+            sim["history"].append({"d": sim["day"], "eq": round(sim["last_eq"], 2)})
+            sim["history"] = sim["history"][-400:]
+        sim["day"], sim["day_start"], sim["limit_logged"] = today, eq, False
+    r = RISK_PROFILES["balanced"]["rules"]
+
+    # 1) sells first: stop-loss, profit targets, then AI sell signals (after the minimum hold)
+    for sym in list(sim["pos"].keys()):
+        p = sim["pos"][sym]
+        price = p.get("last") or 0
+        if price <= 0 or p["qty"] <= 0:
+            continue
+        pct = (price - p["avg"]) / p["avg"] * 100
+        if pct <= -cfg["stop_pct"]:
+            _seed_sell(sim, sym, p["qty"], price, est, now_ts, f"stop-loss, fell {abs(pct):.1f}%")
+            continue
+        if len(p["tiers"]) != len(cfg["tiers"]):
+            p["tiers"] = [False] * len(cfg["tiers"])
+        done = False
+        for i, (tp, fr) in enumerate(cfg["tiers"]):
+            if p["tiers"][i] or pct < tp:
+                continue
+            p["tiers"][i] = True
+            _seed_sell(sim, sym, min(p["qty"], p["origin"] * fr), price, est, now_ts, f"profit target +{pct:.1f}%")
+            done = True
+            break
+        if done:
+            continue
+        if pct >= cfg["final_pct"]:
+            _seed_sell(sim, sym, p["qty"], price, est, now_ts, f"final profit target +{pct:.1f}%")
+            continue
+        sig = signals.get(sym)
+        if sig and (sig.get("ai") or {}).get("side") == "sell":
+            held_min = (now_ts - p.get("bought_at", now_ts)) / 60.0
+            if held_min >= SEEDSIM_MIN_HOLD_MINUTES and _seed_cool_left(sim, sym, "sell", SEEDSIM_COOLDOWN_MINUTES, now_ts) <= 0 \
+                    and _seed_cool_left(sim, sym, "buy", SEEDSIM_COOLDOWN_MINUTES, now_ts) <= 0:
+                _seed_sell(sim, sym, p["qty"], price, est, now_ts, "AI sell signal")
+
+    # 2) at most one new buy per cycle
+    eq = _seed_equity(sim)
+    day_pl = eq - (sim["day_start"] or eq)
+    limit_hit = day_pl <= -cfg["daily_loss"] * st
+    if limit_hit and not sim["limit_logged"]:
+        sim["limit_logged"] = True
+        _seed_log(sim, est, f"🔴 Daily loss limit reached (${day_pl:.2f}). No new buys today.")
+    blocked = limit_hit or cutoff_passed or mtc < SEEDSIM_NO_BUY_LAST_MINUTES
+    required, out_of = _cust_conf_required(regime or {}, 0)
+    if not blocked and required is not None:
+        for sym in MARKET_SCAN_LIST:
+            sig = signals.get(sym)
+            if not sig:
+                continue
+            ai, price = sig["ai"], float(sig["price"] or 0)
+            if price <= 0 or ai.get("side", "buy") != "buy":
+                continue
+            if ai.get("confidence", 0) < r["minConfidence"] or ai.get("volatility", 100) > r["maxVolatility"] or ai.get("sync", 0) < r["minSyncScore"]:
+                continue
+            sigs = list(sig["base"]) + [("ai", True)]
+            agreeing, total = sum(1 for _, ok in sigs if ok), len(sigs)
+            if agreeing < min(required, total):
+                continue
+            if _seed_cool_left(sim, sym, "buy", SEEDSIM_COOLDOWN_MINUTES, now_ts) > 0 or _seed_cool_left(sim, sym, "sell", SEEDSIM_COOLDOWN_MINUTES, now_ts) > 0:
+                continue
+            if sym not in sim["pos"] and len(sim["pos"]) >= cfg["max_positions"]:
+                continue
+            cur_val = sim["pos"][sym]["qty"] * price if sym in sim["pos"] else 0.0
+            invested = sum(q["qty"] * q.get("last", q["avg"]) for q in sim["pos"].values())
+            dollars = min(cfg["chunk"] * st, cfg["max_position"] * st - cur_val, cfg["max_invested"] * st - invested, sim["cash"])
+            if dollars < 1.0:
+                continue
+            _seed_buy(sim, sym, dollars, price, est, now_ts, agreeing, total)
+            break
+
+    eq = _seed_equity(sim)
+    sim["last_eq"] = eq
+    sim["peak"] = max(sim["peak"], eq)
+    if sim["peak"] > 0:
+        sim["max_dd_pct"] = round(max(sim["max_dd_pct"], (sim["peak"] - eq) / sim["peak"] * 100), 2)
+    return sim
+
+def seedsim_summary(sim, cfg):
+    eq = _seed_equity(sim)
+    st = sim["start"]
+    days = len(sim["history"]) + (1 if sim.get("day") else 0)
+    closes = [h["eq"] for h in sim["history"]] + [eq]
+    band = SEEDSIM_DANGLE_BAND_PCT / 100.0
+    stayed_in_band = all(st * (1 - band) <= c <= st * (1 + band) for c in closes)
+    if days < SEEDSIM_DANGLE_DAYS:
+        verdict = f"early ({days} of {SEEDSIM_DANGLE_DAYS} trading days)"
+    elif stayed_in_band:
+        verdict = "dangling (stayed within 2% of the start)"
+    else:
+        verdict = "moving (left the 2% band)"
+    n = sim["wins"] + sim["losses"]
+    return {"key": sim["key"], "label": cfg["label"], "start": st, "equity": eq, "return_pct": round((eq - st) / st * 100, 2),
+            "cash": round(sim["cash"], 2), "realized": round(sim["realized"], 2), "trades": sim["trades"],
+            "win_rate_pct": round(sim["wins"] / n * 100, 1) if n else None,
+            "profit_factor": round(sim["gross_win"] / sim["gross_loss"], 2) if sim["gross_loss"] > 0 else None,
+            "max_dd_pct": sim["max_dd_pct"], "days": days, "verdict": verdict,
+            "positions": [{"symbol": k, "qty": round(v["qty"], 4), "avg": round(v["avg"], 2), "last": round(v.get("last", v["avg"]), 2)} for k, v in sim["pos"].items()],
+            "feed": sim["feed"][:8]}
+
+def seedsim_cycle():
+    if not SEEDSIM_ENABLED or not is_market_hours():
+        return
+    if not _cust_shared["signals"] or time.time() - _cust_shared["ts"] > 600:
+        _cust_refresh_shared()
+    signals, regime = _cust_shared["signals"], _cust_shared["regime"] or {}
+    if not signals:
+        return
+    est = datetime.now(pytz.timezone("America/New_York"))
+    mtc = _minutes_to_close(est)
+    cutoff = PAPER_NO_BUY_AFTER_MIN is not None and _paper_buy_cutoff_passed(est=est, cutoff=PAPER_NO_BUY_AFTER_MIN)
+    today = est.strftime("%Y-%m-%d")
+    for key, cfg in SEEDSIM_CONFIGS.items():
+        sim = _copy.deepcopy(seedsim_state["sims"].get(key) or _seed_new_sim(key, today))
+        seedsim_run_cycle(sim, cfg, signals, regime, est, mtc, cutoff)
+        seedsim_state["sims"][key] = sim          # swap in the finished copy in one step
+    save_state()
+
+def seedsim_loop():
+    time.sleep(90)       # start a little after the live engine so they share one AI scan
+    while True:
+        try:
+            seedsim_cycle()
+        except Exception as e:
+            logger.error(f"seed sim error: {type(e).__name__}: {str(e)[:120]}")
+        time.sleep(300)
+
+@app.route("/api/seedsim/status")
+@require_api_key
+def seedsim_status():
+    out = {"enabled": SEEDSIM_ENABLED, "start": SEEDSIM_START, "dangle_days": SEEDSIM_DANGLE_DAYS, "sims": []}
+    for key, cfg in SEEDSIM_CONFIGS.items():
+        sim = seedsim_state["sims"].get(key)
+        if sim:
+            out["sims"].append(seedsim_summary(sim, cfg))
+    return jsonify(out)
+
+@app.route("/api/seedsim/reset", methods=["POST"])
+@require_api_key
+def seedsim_reset():
+    """Start both pretend accounts over from the current SEEDSIM_START amount."""
+    seedsim_state["sims"] = {}
+    save_state()
+    return jsonify({"ok": True})
+
 # Started from inside the process that SERVES requests, never at import time.
 # gunicorn can import this file in its master process and then fork the worker.
 # Threads don't survive a fork, so threads started at import lived in the master
@@ -5172,6 +5413,9 @@ def ensure_background_threads():
         # Owner's live-money engine: only with LIVE_ENGINE=1 and live keys; starts in practice mode.
         if _live_ready():
             threading.Thread(target=live_engine_loop, daemon=True).start()
+        # Seed sim: pretend $300 accounts, no orders and no keys needed.
+        if SEEDSIM_ENABLED:
+            threading.Thread(target=seedsim_loop, daemon=True).start()
 
 @app.before_request
 def _boot_background_threads():

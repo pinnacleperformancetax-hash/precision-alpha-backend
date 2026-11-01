@@ -4569,12 +4569,16 @@ def _cust_conn(token):
     """How to talk to a customer's paper account (OAuth token)."""
     return {"base": CUST_ALPACA_BASE, "hdrs": _cust_hdrs(token), "dry": False}
 
-def _cust_order(conn, sym, qty, side):
+def _cust_order(conn, sym, qty, side, notional=None):
     if conn.get("dry"):
         return True      # practice run: pretend it worked, send nothing
     try:
-        r = requests.post(f"{conn['base']}/orders", headers=conn["hdrs"], timeout=10,
-                          json={"symbol": sym, "qty": str(qty), "side": side, "type": "market", "time_in_force": "day"})
+        body = {"symbol": sym, "side": side, "type": "market", "time_in_force": "day"}
+        if notional:                       # live fractional buy: a dollar amount
+            body["notional"] = f"{float(notional):.2f}"
+        else:
+            body["qty"] = f"{qty:.6f}" if isinstance(qty, float) else str(qty)
+        r = requests.post(f"{conn['base']}/orders", headers=conn["hdrs"], timeout=10, json=body)
         if r.ok:
             conn["last_err"] = None
             return True
@@ -4711,9 +4715,15 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
         positions = {p["symbol"]: p for p in pr.json()}
         if conn.get("dry"):
             equity, last_equity, buying_power = _sim_overlay(st, signals, positions, cash_now, today)
+        frac = bool(caps) and LIVE_FRACTIONAL      # live account only, and only when switched on
         pend_buy, pend_sell = {}, {}
         for o in orr.json():
-            q = int(float(o.get("qty") or 0))
+            q = float(o.get("qty") or 0)
+            if not q and o.get("notional"):
+                _px = float((signals.get(o.get("symbol")) or {}).get("price") or 0)
+                q = float(o["notional"]) / _px if _px > 0 else 0.0
+            if not frac:
+                q = int(q)
             d = pend_buy if o.get("side") == "buy" else pend_sell
             d[o.get("symbol")] = d.get(o.get("symbol"), 0) + q
 
@@ -4722,7 +4732,7 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
             qf = float(pos.get("qty", 0))
             if qf <= 0:
                 continue
-            qty = int(qf)
+            qty = (int(qf * 1e6) / 1e6) if frac else int(qf)
             if qty <= pend_sell.get(sym, 0):
                 continue
             price, entry = float(pos.get("current_price", 0)), float(pos.get("avg_entry_price", 0))
@@ -4744,7 +4754,12 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
             for i, (tp, fr) in enumerate([(r["scaleOutTier1Pct"], r["scaleOutTier1Frac"]), (r["scaleOutTier2Pct"], r["scaleOutTier2Frac"])]):
                 if ss["tiers_hit"][i] or pct < tp:
                     continue
-                sq = min(qty, max(1, round(ss["origin_qty"] * fr)))
+                if frac:
+                    sq = min(qty, round(ss["origin_qty"] * fr, 6))
+                    if sq * price < 1 or (qty - sq) * price < 1:
+                        sq = qty          # too small to split: sell it all
+                else:
+                    sq = min(qty, max(1, round(ss["origin_qty"] * fr)))
                 if _cust_order(conn, sym, sq, "sell"):
                     if conn.get("dry"): _sim_apply(st, sym, sq, "sell", price)
                     ss["tiers_hit"][i] = True
@@ -4795,9 +4810,10 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
             side = ai.get("side", "buy")
             if conf < r["minConfidence"] or vol > r["maxVolatility"] or sync < r["minSyncScore"]:
                 continue
-            held = int(float(positions[sym]["qty"])) if sym in positions else 0
+            held = (float(positions[sym]["qty"]) if frac else int(float(positions[sym]["qty"]))) if sym in positions else 0
             if held < 0:
                 continue
+            buy_dollars = None
             if side == "buy":
                 if limit_hit:
                     continue
@@ -4814,7 +4830,7 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                 if agreeing < min(required, total):
                     continue
                 cur = held + pend_buy.get(sym, 0)
-                if cur >= r["maxSharesPerStock"]:
+                if not frac and cur >= r["maxSharesPerStock"]:
                     continue
                 if _cust_cooldown_left(st, sym, "sell", r["cooldownMinutes"]) > 0:
                     continue
@@ -4823,9 +4839,9 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                 if sym in positions and r.get("maxDailyLossPerStock"):
                     if float(positions[sym].get("unrealized_intraday_pl", 0) or 0) <= -r["maxDailyLossPerStock"]:
                         continue
-                if buying_power < price:
+                if not frac and buying_power < price:
                     continue
-                if cash_acct and st.get("day_spend", 0.0) + price > st.get("cash_start", 0.0):
+                if cash_acct and not frac and st.get("day_spend", 0.0) + price > st.get("cash_start", 0.0):
                     continue          # would spend money from today's sales (not settled yet)
                 if caps:
                     # near-close cutoff: no NEW live buys in the last N minutes, so fewer positions are
@@ -4834,17 +4850,29 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                         continue
                     if LIVE_NO_BUY_AFTER_MIN is not None and _paper_buy_cutoff_passed(cutoff=LIVE_NO_BUY_AFTER_MIN):
                         continue          # live account: same noon cutoff as paper (afternoon buys have lost money)
-                    if price > caps["max_price"]:
+                    if not frac and price > caps["max_price"]:
                         continue
-                    if (cur + 1) * price > caps["max_position"]:
+                    if not frac and (cur + 1) * price > caps["max_position"]:
                         continue
                     invested = sum(float(p.get("market_value", 0) or 0) for p in positions.values())
                     invested += sum(q * (signals.get(s2, {}).get("price", 0)) for s2, q in pend_buy.items())
-                    if invested + price > caps["max_invested"]:
+                    if not frac and invested + price > caps["max_invested"]:
                         continue
-                    if bear_test:
+                    if frac:
+                        room = [LIVE_FRAC_CHUNK, caps["max_position"] - cur * price, caps["max_invested"] - invested, buying_power]
+                        if cash_acct:
+                            room.append(st.get("cash_start", 0.0) - st.get("day_spend", 0.0))
+                        if bear_test:
+                            if cur > 0:
+                                continue
+                            room.append(LIVE_BEAR_MAX_INVESTED - invested)
+                        buy_dollars = round(min(room), 2)
+                        if buy_dollars < 5:
+                            continue          # not enough room for a worthwhile buy
+                    if bear_test and not frac:
                         if cur >= 1 or invested + price > LIVE_BEAR_MAX_INVESTED:
                             continue
+                    if bear_test:
                         if st.get("bear_logged_day") != today:
                             st["bear_logged_day"] = today
                             _cust_log(st, pre + f"🧪 Bear-market TEST MODE: market is trending down, but test buys are allowed (1 share per stock, up to ${LIVE_BEAR_MAX_INVESTED:g} invested).")
@@ -4867,17 +4895,29 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                     continue          # live account: hold a while before an AI sell signal can close it
             if not is_market_hours():
                 break
-            if _cust_order(conn, sym, 1, side):
-                if conn.get("dry"): _sim_apply(st, sym, 1, side, price)
+            if frac and side == "buy":
+                order_qty = round(buy_dollars / price, 6)
+            elif frac:
+                order_qty = int((held - pend_sell.get(sym, 0)) * 1e6) / 1e6     # AI sell: close the whole position
+                if order_qty <= 0:
+                    continue
+            else:
+                order_qty = 1
+            if _cust_order(conn, sym, order_qty, side, notional=buy_dollars if (frac and side == "buy") else None):
+                if conn.get("dry"): _sim_apply(st, sym, order_qty, side, price)
                 st["cooldowns"].setdefault(sym, {})[side] = time.time()
                 if side == "buy" and cash_acct:
-                    st["day_spend"] = round(st.get("day_spend", 0.0) + price, 2)
-                if side == "buy":
+                    st["day_spend"] = round(st.get("day_spend", 0.0) + (buy_dollars if frac else price), 2)
+                if side == "buy" and frac:
+                    _cust_log(st, pre + f"🟢 Bought ${buy_dollars:.2f} of {sym} (about {order_qty:.4f} shares at ${price:.2f}). {agreeing} of {total} signals agreed.")
+                elif side == "buy":
                     _cust_log(st, pre + f"🟢 Bought 1 {sym} at about ${price:.2f}. {agreeing} of {total} signals agreed.")
+                elif frac:
+                    _cust_log(st, pre + f"🔴 Sold all {order_qty:.4f} {sym} at about ${price:.2f} on an AI sell signal.")
                 else:
                     _cust_log(st, pre + f"🔴 Sold 1 {sym} at about ${price:.2f} on an AI sell signal.")
             else:
-                _cust_reject(st, conn, sym, side, 1, pre)
+                _cust_reject(st, conn, sym, side, order_qty, pre)
             break
     except Exception as e:
         logger.error(f"customer cycle failed for {uid}: {type(e).__name__}: {str(e)[:120]}")
@@ -5040,6 +5080,12 @@ LIVE_BEAR_MAX_INVESTED = _live_num("LIVE_BEAR_MAX_INVESTED", 100)
 # Live account noon cutoff: same rule as the paper engine (no NEW buys after this time, New York time; default
 # 12:00 PM). Stops, profit-taking and AI sells keep running. Off with LIVE_NO_BUY_AFTER=off, or e.g. 13:30.
 LIVE_NO_BUY_AFTER_MIN = _parse_cutoff_minutes(os.environ.get("LIVE_NO_BUY_AFTER"))
+# Fractional shares for the LIVE account (OFF by default; set LIVE_FRACTIONAL=1 in Render to turn on). Buys become
+# dollar amounts (LIVE_FRAC_CHUNK, default $40) instead of 1 whole share, so the $700 can spread over many stocks and
+# the share-price cap no longer applies. Dollar caps (invested / per-stock) still apply. AI sells close the whole
+# position. Paper and customer accounts are never affected.
+LIVE_FRACTIONAL = os.environ.get("LIVE_FRACTIONAL", "").strip() == "1"
+LIVE_FRAC_CHUNK = _live_num("LIVE_FRAC_CHUNK", 40)
 LIVE_RISK = os.environ.get("LIVE_RISK_LEVEL", "balanced").strip().lower()
 if LIVE_RISK not in RISK_PROFILES:
     LIVE_RISK = "balanced"
@@ -5091,6 +5137,7 @@ def live_status():
     out = {"enabled": LIVE_ENGINE_ENABLED, "keys_set": bool(LIVE_KEY and LIVE_SECRET), "practice_mode": LIVE_DRY_RUN,
            "paused": live_engine["paused"], "risk_level": LIVE_RISK, "caps": LIVE_CAPS, "min_hold_minutes": LIVE_MIN_HOLD_MINUTES,
            "no_buy_last_minutes": LIVE_NO_BUY_LAST_MINUTES, "no_buy_after": _cutoff_label(LIVE_NO_BUY_AFTER_MIN),
+           "fractional": LIVE_FRACTIONAL, "frac_chunk": LIVE_FRAC_CHUNK,
            "last_cycle": live_engine["last_cycle"], "last_error": live_engine["last_error"]}
     if _live_ready():
         try:

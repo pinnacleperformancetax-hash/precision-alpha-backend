@@ -1821,6 +1821,17 @@ def check_and_sell_positions():
                             save_state()
                         continue
 
+            # --- Crash-mode time limit: a position bought by crash mode is sold after CRASH_MAX_HOLD_DAYS ---
+            cmeta = engine_state.get('crash_state', {}).get(symbol)
+            if cmeta and (time.time() - float(cmeta.get('ts') or 0)) >= CRASH_MAX_HOLD_DAYS * 86400:
+                reason = f"Crash-mode time limit: held {CRASH_MAX_HOLD_DAYS:g} days ({pct_gain:+.1f}% vs your entry)"
+                if _sell_shares(symbol, qty, current_price, reason, unrealized_pl, avg_entry=avg_entry):
+                    engine_state['scale_state'].pop(symbol, None)
+                    engine_state['crash_state'].pop(symbol, None)
+                    log_customer(f"Sold {qty} {symbol}: the crash-mode time limit ({CRASH_MAX_HOLD_DAYS:g} days) was reached.")
+                    save_state()
+                continue
+
             # --- Tiered scale-out on profit ---
 
             tier_defs = [
@@ -1851,6 +1862,10 @@ def check_and_sell_positions():
 
         # Clean up tracking for anything no longer held at all (fully closed
         # by a manual sell, a stop-loss above, or the final tier above).
+        # crash-mode tags: forget a symbol once it is no longer held (give a fresh order 2 hours to show up)
+        cstate = engine_state.get('crash_state') or {}
+        for s_ in [x for x in cstate if x not in held_symbols and time.time() - float(cstate[x].get('ts') or 0) > 7200]:
+            cstate.pop(s_, None)
         stale = [s for s in engine_state['scale_state'] if s not in held_symbols]
         if stale:
             for s in stale:
@@ -2236,6 +2251,112 @@ def evaluate_confluence(symbol, price, ai_result, vol_data, sentiment):
     agreeing = sum(1 for _, ok in signals if ok)
     return agreeing, len(signals), signals
 
+# ---------------------------------------------------------------------------
+# CRASH MODE (PAPER engine only). When the S&P is far below its 20-day average (a real sell-off), the normal rules
+# stop all buying. Crash mode instead buys a few sharply oversold, still-healthy large stocks in small pieces, with
+# limit orders, and gets out on a bounce, the stops, or a time limit. The live account and customers are not touched.
+# Env: CRASH_MODE=0 turns it off. CRASH_SPY_BELOW_PCT (3) how far under the 20-day average counts as a crash;
+# CRASH_RSI_MAX (30) how oversold; CRASH_CHUNK (250) dollars per buy; CRASH_MAX_POSITIONS (3);
+# CRASH_MAX_HOLD_DAYS (7) calendar days before a crash position is sold regardless.
+# ---------------------------------------------------------------------------
+CRASH_MODE = os.environ.get("CRASH_MODE", "1").strip() != "0"
+CRASH_SPY_BELOW_PCT = _trail_num("CRASH_SPY_BELOW_PCT", 3)
+CRASH_RSI_MAX = _trail_num("CRASH_RSI_MAX", 30)
+CRASH_CHUNK = _trail_num("CRASH_CHUNK", 250)
+CRASH_MAX_POSITIONS = int(_trail_num("CRASH_MAX_POSITIONS", 3))
+CRASH_MAX_HOLD_DAYS = _trail_num("CRASH_MAX_HOLD_DAYS", 7)
+
+def crash_active(regime):
+    """True when SPY is at least CRASH_SPY_BELOW_PCT under its own 20-day average."""
+    try:
+        if not CRASH_MODE or regime.get('trend') != 'bear':
+            return False
+        sma, px = float(regime.get('spy_sma20') or 0), float(regime.get('spy_price') or 0)
+        return sma > 0 and px > 0 and (sma - px) / sma * 100 >= CRASH_SPY_BELOW_PCT
+    except Exception:
+        return False
+
+def crash_pick(closes):
+    """Pure rule: is this stock a crash-mode dip? Returns the RSI if yes, else None.
+    Oversold (RSI under CRASH_RSI_MAX) but not broken: price still above 90% of its 50-day average."""
+    if len(closes) < 51:
+        return None
+    r = _rsi(closes)
+    sma50 = _sma(closes, 50)
+    if r is None or not sma50:
+        return None
+    if r < CRASH_RSI_MAX and closes[-1] > sma50 * 0.9:
+        return r
+    return None
+
+def crash_scan(regime):
+    """Places at most ONE crash-mode buy per scan. Returns True if it placed an order."""
+    try:
+        cs = engine_state.setdefault('crash_state', {})
+        pr = requests.get(f"{ALPACA_BASE_URL}/positions", headers=alpaca_hdrs(), timeout=10)
+        if not pr.ok:
+            return False
+        held_syms = {p.get('symbol') for p in pr.json() if float(p.get('qty', 0) or 0) > 0}
+        open_crash = [sym for sym in cs if sym in held_syms]
+        dist = (float(regime['spy_sma20']) - float(regime['spy_price'])) / float(regime['spy_sma20']) * 100
+        log_scan(f"🧯 CRASH MODE on: SPY is {dist:.1f}% under its 20-day average. Looking for oversold large stocks (RSI under {CRASH_RSI_MAX:g}). Crash positions open: {len(open_crash)}/{CRASH_MAX_POSITIONS}")
+        if len(open_crash) >= CRASH_MAX_POSITIONS:
+            log_scan("🧯 Crash mode: position limit reached, no more crash buys")
+            return False
+        picks = []
+        for sym in MARKET_SCAN_LIST:
+            if sym in held_syms:
+                continue
+            closes = get_daily_closes(sym, days=70)
+            r = crash_pick(closes)
+            if r is not None:
+                picks.append((r, sym))
+        picks.sort()
+        if not picks:
+            log_scan("🧯 Crash mode: nothing oversold enough (and still above its 50-day trend) this scan")
+            return False
+        for r, sym in picks:
+            qr = requests.get(f"{ALPACA_DATA_URL}/stocks/{sym}/trades/latest", headers=alpaca_hdrs(), timeout=10)
+            price = qr.json().get('trade', {}).get('p', 0) if qr.ok else 0
+            if not price or price < 5:
+                continue
+            qty = int(CRASH_CHUNK // price)
+            if qty < 1:
+                log_scan(f"🧯 {sym} @ ${price:.2f} — skipped: 1 share is over the ${CRASH_CHUNK:g} crash-buy size")
+                continue
+            if cooldown_left(sym, 'sell') > 0 or cooldown_left(sym, 'buy') > 0:
+                continue
+            exposure = get_exposure(sym)
+            if exposure is None or exposure[0] != 0 or exposure[1] != 0:
+                continue
+            blocked = capital_cap_blocks(price * qty)
+            if blocked:
+                log_scan(f"🧯 {sym} — trading-account cap: {blocked}")
+                continue
+            if not is_market_hours():
+                return False
+            limit = round(price * 1.003, 2)
+            or_ = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(),
+                json={"symbol": sym, "qty": str(qty), "side": "buy", "type": "limit", "limit_price": str(limit),
+                      "time_in_force": "day"}, timeout=10)
+            if not or_.ok:
+                log_scan(f"❌ {sym} — crash-mode order failed")
+                continue
+            note_trade(sym, 'buy')
+            cs[sym] = {'ts': time.time(), 'entry': price}
+            engine_state['weekly_trades'].append({'symbol': sym, 'side': 'buy', 'qty': qty, 'price': price, 'source': 'crash'})
+            entry = f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · CRASH-MODE BUY: {qty} {sym} @ ${price:.2f} (limit ${limit:.2f}) · RSI {r}, oversold while the S&P is {dist:.1f}% under its 20-day average"
+            engine_state['trade_log'].insert(0, entry)
+            engine_state['trade_log'] = engine_state['trade_log'][:50]
+            log_customer(f"🧯 Crash mode bought {qty} {sym}: it's sharply oversold (RSI {r}) but still above its 50-day trend. It sells on a bounce, the stop-loss, or after {CRASH_MAX_HOLD_DAYS:g} days.")
+            save_state()
+            log_scan(f"🚀 ORDER PLACED (CRASH MODE): BUY {qty} {sym} @ ${price:.2f}, limit ${limit:.2f}")
+            return True
+        return False
+    except Exception as e:
+        log_scan(f"⚠️ Crash mode error: {type(e).__name__}: {str(e)[:80]}")
+        return False
+
 def auto_scan():
     reset_if_needed()
     sweep_vault_if_due()
@@ -2262,6 +2383,9 @@ def auto_scan():
         f" (SPY ${market_regime['spy_price']} vs 20d SMA ${market_regime['spy_sma20']})"
         if market_regime.get('spy_price') else ""
     ))
+
+    if crash_active(market_regime) and not no_buy_now:
+        crash_scan(market_regime)
 
     log_scan(f"🔍 Scanning {len(MARKET_SCAN_LIST)} stocks...")
     for symbol in MARKET_SCAN_LIST:
@@ -2339,6 +2463,9 @@ def auto_scan():
                 sellable = held - pending_sell
                 if sellable <= 0:
                     log_scan(f"⏭ {symbol} — SELL signal but no long shares to sell (shorting disabled), skipping")
+                    continue
+                if symbol in engine_state.get('crash_state', {}):
+                    log_scan(f"🧯 {symbol} — AI sell signal ignored: it's a crash-mode position (exits: bounce target, stops, or the time limit)")
                     continue
                 left = cooldown_left(symbol, 'buy')
                 if left > 0:

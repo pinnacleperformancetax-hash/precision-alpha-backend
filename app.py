@@ -81,7 +81,7 @@ def require_api_key(fn):
         return fn(*args, **kwargs)
     return wrapper
 
-MARKET_SCAN_LIST = ['AAPL','TSLA','NVDA','SPY','QQQ','MSFT','AMD','META','GOOGL','AMZN','NFLX','SOFI','PLTR','RIVN','COIN','SMCI','ARM','UBER','ORCL','JPM','V','DIS','BAC','CRM','PANW']
+MARKET_SCAN_LIST = ['AAPL','TSLA','NVDA','SPY','QQQ','MSFT','AMD','META','GOOGL','AMZN','NFLX','SOFI','PLTR','RIVN','COIN','SMCI','ARM','UBER','ORCL','JPM','V','DIS','BAC','CRM','PANW','MA','ABT','DHR','TJX','DAL','UAL','DXCM']
 
 RULES = {
     'maxDailyLoss': 30, 'maxTrades': 999, 'maxPositionSize': 200,
@@ -3897,7 +3897,7 @@ def get_trade_history():
 # ---------------------------------------------------------------------------
 def _source_of_symbol(sym):
     """Label a stock by the engine that trades it. Matched by stock, not by order:
-    a stock on the Auto Engine's 25-stock scan list counts as Auto Engine; a stock the
+    a stock on the Auto Engine's scan list counts as Auto Engine; a stock the
     congressional copy engine has bought (and the scan list doesn't hold) counts as
     Congress copy; anything else is Other / manual."""
     try:

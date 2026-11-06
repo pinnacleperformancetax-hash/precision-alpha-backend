@@ -4409,6 +4409,37 @@ def backtest_swing_route():
         return _safe_err(e)
 
 
+@app.route("/api/backtest/dips")
+@require_api_key
+def backtest_dips_route():
+    """Read-only: would BUYING WEAKNESS (sharp dips, even while the S&P is falling) have beaten the current
+    trend-following rules? The older mean-reversion row in /api/backtest still obeys the market filter, so it never
+    buys during a sell-off. These variants switch that filter off. Same stability tests as /robust."""
+    try:
+        bars = _bt_load_bars(2)
+        if not bars.get("SPY") or len(bars["SPY"]) < 150:
+            return jsonify({"error": "Not enough price history returned"}), 502
+        reports = [
+            robustness_report(bars, "Current style: 2 of 3 signals · strict market filter (no buys while the S&P is falling)",
+                              strategy="technical", min_signals=2),
+            robustness_report(bars, "Buy-the-dip A: sharp dips (RSI under 30), but only while the S&P is above its 20-day average",
+                              strategy="mean_reversion"),
+            robustness_report(bars, "Buy-the-dip B: same dips, market filter OFF (buys through sell-offs and crashes)",
+                              strategy="mean_reversion", use_regime=False),
+            robustness_report(bars, "Buy-the-dip C: filter OFF + 5% circuit breaker (pauses buying 10 days after a 5% account drop)",
+                              strategy="mean_reversion", use_regime=False, breaker_pct=5.0),
+            robustness_report(bars, "Buy-the-dip D: filter OFF + wider 7% stop (dips often keep falling before they bounce)",
+                              strategy="mean_reversion", use_regime=False, stop_pct=7.0),
+        ]
+        return jsonify({"days": len(bars["SPY"]), "reports": reports,
+                        "notes": ["A dip is a stock with RSI under 30 that is still above 90% of its 50-day average; it sells when RSI recovers above 50 or after 5 days.",
+                                  "Technical rules only; sentiment and AI signals cannot be replayed on past data.",
+                                  "Orders fill at the next day's open with 0.05% slippage per side; cash-account settlement delays are ignored.",
+                                  "The 2 years of history include the April 2025 sell-off, so the 'filter OFF' rows show what buying through a crash actually did."]})
+    except Exception as e:
+        return _safe_err(e)
+
+
 @app.route("/api/backtest")
 @require_api_key
 def backtest_route():

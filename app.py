@@ -1737,6 +1737,20 @@ def _sell_shares(symbol, qty, current_price, reason, unrealized_pl_for_log, avg_
         log_scan(f"❌ Failed to sell {symbol}")
         return False
 
+# Trailing stop (PAPER engine only; the live account and customer accounts are not affected).
+# Once a stock is up at least TRAIL_ARM_PCT over what you paid, the engine remembers its highest price and sells
+# everything if it then falls TRAIL_PCT below that high. Fixes the gap where a gain between +5% and the fixed
+# stop could fade away unsold. Env: TRAIL_STOP=0 turns it off; TRAIL_ARM_PCT (default 5); TRAIL_PCT (default 3).
+def _trail_num(name, default):
+    try:
+        v = float(os.environ.get(name, "").strip() or default)
+        return v if v > 0 else float(default)
+    except Exception:
+        return float(default)
+TRAIL_ENABLED = os.environ.get("TRAIL_STOP", "1").strip() != "0"
+TRAIL_ARM_PCT = _trail_num("TRAIL_ARM_PCT", 5)
+TRAIL_PCT = _trail_num("TRAIL_PCT", 3)
+
 def check_and_sell_positions():
     """Stop-loss (full exit, unchanged) + tiered scale-out on profit (NEW):
     instead of one all-or-nothing take-profit at takeProfitPct, sells a
@@ -1782,13 +1796,32 @@ def check_and_sell_positions():
                     save_state()
                 continue
 
-            # --- Tiered scale-out on profit ---
             st = engine_state['scale_state'].setdefault(symbol, {'origin_qty': qty, 'tiers_hit': [False, False]})
             if qty > st['origin_qty']:
                 # Position grew (scaled in further) past its previous high —
                 # rebase tier fractions to the new size and re-arm both tiers.
                 st['origin_qty'] = qty
                 st['tiers_hit'] = [False, False]
+
+            # --- Trailing stop: remember the high; once armed, sell everything on a TRAIL_PCT pullback ---
+            if TRAIL_ENABLED and avg_entry > 0 and current_price > 0:
+                hi = max(float(st.get('high') or 0), current_price)
+                st['high'] = hi
+                if (hi - avg_entry) / avg_entry * 100 >= TRAIL_ARM_PCT:
+                    if not st.get('trail_armed'):
+                        st['trail_armed'] = True
+                        log_scan(f"🪢 {symbol} — trailing stop armed (high ${hi:.2f}, sells if it falls {TRAIL_PCT:g}% below the high)")
+                        save_state()
+                    if current_price <= hi * (1 - TRAIL_PCT / 100.0):
+                        drop = (hi - current_price) / hi * 100
+                        reason = f"Trailing stop: fell {drop:.1f}% from its high of ${hi:.2f} (still {pct_gain:+.1f}% vs your entry)"
+                        if _sell_shares(symbol, qty, current_price, reason, unrealized_pl, avg_entry=avg_entry):
+                            engine_state['scale_state'].pop(symbol, None)
+                            log_customer(f"Sold {qty} {symbol}: it pulled back {drop:.1f}% from its high, so the trailing stop locked in the gain ({pct_gain:+.1f}% vs your entry).")
+                            save_state()
+                        continue
+
+            # --- Tiered scale-out on profit ---
 
             tier_defs = [
                 (r['scaleOutTier1Pct'], r['scaleOutTier1Frac']),
@@ -2712,6 +2745,11 @@ def congress_scan():
             # Cap the buy quantity so we never cross maxSharesPerStock,
             # even when maxPositionSize / price would normally buy more.
             room_left = cap - current_qty
+            if price > RULES['maxPositionSize']:
+                # 1 share alone is bigger than the per-stock dollar limit: skip it (a stop-loss on a
+                # $400-$900 share costs several times what the limit allows).
+                log_congress(f"⏭️ {ticker} @ ${price:.2f} — skipped: 1 share is over the ${RULES['maxPositionSize']:g} per-stock limit")
+                continue
             qty = max(1, min(room_left, int(RULES['maxPositionSize'] / price)))
             if qty <= 0:
                 continue

@@ -2375,6 +2375,9 @@ def crash_scan(regime):
                 continue
             note_trade(sym, 'buy')
             cs[sym] = {'ts': time.time(), 'entry': price}
+            hist = engine_state.setdefault('crash_history', [])
+            hist.append({'symbol': sym, 'ts': time.time()})
+            del hist[:-300]
             engine_state['weekly_trades'].append({'symbol': sym, 'side': 'buy', 'qty': qty, 'price': price, 'source': 'crash'})
             entry = f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · CRASH-MODE BUY: {qty} {sym} @ ${price:.2f} (limit ${limit:.2f}) · RSI {r}, oversold while the S&P is {dist:.1f}% under its 20-day average"
             engine_state['trade_log'].insert(0, entry)
@@ -3930,12 +3933,27 @@ def get_trade_history():
 # Track-record scorecard (paper account): the evidence a funded program,
 # a lawyer, or you would want before any real scaling. Read-only.
 # ---------------------------------------------------------------------------
-def _source_of_symbol(sym):
-    """Label a stock by the engine that trades it. Matched by stock, not by order:
-    a stock on the Auto Engine's scan list counts as Auto Engine; a stock the
-    congressional copy engine has bought (and the scan list doesn't hold) counts as
-    Congress copy; anything else is Other / manual."""
+def _is_crash_buy(sym, t_in):
+    """True if this lot was bought by crash mode: same stock, filled within 8 hours after crash mode placed its order."""
     try:
+        if not t_in:
+            return False
+        t = datetime.fromisoformat(str(t_in).replace("Z", "+00:00")).timestamp()
+        for h in engine_state.get("crash_history", []):
+            if h.get("symbol") == sym and -120 <= t - float(h.get("ts") or 0) <= 8 * 3600:
+                return True
+    except Exception:
+        pass
+    return False
+
+def _source_of_symbol(sym, t_in=None):
+    """Label a trade by the engine that made it. Crash-mode buys are matched by order (stock + time) and count as
+    "Crash mode". Everything else is matched by stock: a stock on the Auto Engine's scan list counts as Auto Engine; a
+    stock the congressional copy engine has bought (and the scan list doesn't hold) counts as Congress copy; anything
+    else is Other / manual."""
+    try:
+        if _is_crash_buy(sym, t_in):
+            return "Crash mode"
         if sym in MARKET_SCAN_LIST:
             return "Auto Engine"
         cong = {str(k).split("_", 1)[1] for k in congress_state.get("copied_trades", []) if "_" in str(k)}
@@ -4090,7 +4108,10 @@ def compute_scorecard(equity_pts, spy_pts, fills, exposure_pts=None, source_of=N
         if source_of:
             for c in closed:
                 try:
-                    k = source_of(c["symbol"])
+                    try:
+                        k = source_of(c["symbol"], c.get("t_in"))
+                    except TypeError:
+                        k = source_of(c["symbol"])
                 except Exception:
                     k = "Other / manual"
                 r = by_src.setdefault(k, {"trades": 0, "pl": 0.0, "wins": 0, "gain": 0.0, "loss": 0.0})

@@ -4470,24 +4470,40 @@ def robustness_report(bars, label, **kw):
 
 _bt_cache = {"ts": 0, "bars": None}
 
+_bt_lock = threading.Lock()
+
+def _bt_fetch_one(sym, start):
+    """Downloads one symbol's daily bars. Returns (symbol, bars or None)."""
+    try:
+        r = requests.get(f"{ALPACA_DATA_URL}/stocks/{sym}/bars", headers=alpaca_hdrs(), timeout=20,
+                         params={"timeframe": "1Day", "start": start, "limit": 1000, "feed": "iex",
+                                 "adjustment": "split"})
+        if r.ok:
+            return sym, [{"d": b["t"][:10], "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b["v"]}
+                         for b in r.json().get("bars", [])]
+    except Exception as e:
+        logger.warning(f"backtest bars {sym}: {e}")
+    return sym, None
+
 def _bt_load_bars(years=2):
+    """Price history for every scan-list stock + SPY. Downloads in parallel (the old one-by-one loop took longer than
+    the server's request timeout once the list grew) and only ONE request downloads at a time: the others wait and
+    then reuse the one-hour cache."""
     if _bt_cache["bars"] and time.time() - _bt_cache["ts"] < 3600:
         return _bt_cache["bars"]
-    start = (datetime.utcnow() - timedelta(days=int(365 * years) + 10)).strftime("%Y-%m-%dT00:00:00Z")
-    out = {}
-    for sym in sorted(set(MARKET_SCAN_LIST + ["SPY"])):
-        try:
-            r = requests.get(f"{ALPACA_DATA_URL}/stocks/{sym}/bars", headers=alpaca_hdrs(), timeout=20,
-                             params={"timeframe": "1Day", "start": start, "limit": 1000, "feed": "iex",
-                                     "adjustment": "split"})
-            if r.ok:
-                out[sym] = [{"d": b["t"][:10], "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b["v"]}
-                            for b in r.json().get("bars", [])]
-        except Exception as e:
-            logger.warning(f"backtest bars {sym}: {e}")
-    if out.get("SPY"):
-        _bt_cache["ts"], _bt_cache["bars"] = time.time(), out
-    return out
+    with _bt_lock:
+        if _bt_cache["bars"] and time.time() - _bt_cache["ts"] < 3600:
+            return _bt_cache["bars"]
+        start = (datetime.utcnow() - timedelta(days=int(365 * years) + 10)).strftime("%Y-%m-%dT00:00:00Z")
+        syms = sorted(set(MARKET_SCAN_LIST + ["SPY"]))
+        out = {}
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for sym, bars in ex.map(lambda x: _bt_fetch_one(x, start), syms):
+                if bars is not None:
+                    out[sym] = bars
+        if out.get("SPY"):
+            _bt_cache["ts"], _bt_cache["bars"] = time.time(), out
+        return out
 
 
 @app.route("/api/backtest/robust")

@@ -2266,6 +2266,37 @@ CRASH_CHUNK = _trail_num("CRASH_CHUNK", 250)
 CRASH_MAX_POSITIONS = int(_trail_num("CRASH_MAX_POSITIONS", 3))
 CRASH_MAX_HOLD_DAYS = _trail_num("CRASH_MAX_HOLD_DAYS", 7)
 
+# Paper-engine minimum hold: an AI SELL signal is ignored until the position is PAPER_MIN_HOLD_DAYS old (default 3
+# calendar days; 0 turns it off). Your own track record: positions held over 3 days earned about +$4,000, everything
+# shorter lost about $2,500, and the swing backtest agrees a modest hold beats selling early. Stop-loss, profit
+# taking, the trailing stop and the crash-mode time limit are never delayed. The live account keeps its own 2-hour hold.
+try:
+    PAPER_MIN_HOLD_DAYS = max(0.0, float(os.environ.get("PAPER_MIN_HOLD_DAYS", "").strip() or 3))
+except Exception:
+    PAPER_MIN_HOLD_DAYS = 3.0
+
+def _paper_hold_left_days(symbol):
+    """Days still to wait before an AI sell of `symbol` is allowed (0 = allowed). Uses the newer of the engine's own
+    last-buy timestamp and Alpaca's fill history, so it also covers positions bought before this rule existed."""
+    try:
+        if PAPER_MIN_HOLD_DAYS <= 0:
+            return 0.0
+        t = float(engine_state.get('cooldowns', {}).get(symbol, {}).get('buy') or 0)
+        try:
+            sync_ledger_from_fills(max_age=60)
+            for f in reversed(_fill_cache['fills']):          # newest first
+                if f.get('symbol') == symbol and str(f.get('side', '')).lower() == 'buy':
+                    ft = datetime.fromisoformat(f['transaction_time'].replace('Z', '+00:00')).timestamp()
+                    t = max(t, ft)
+                    break
+        except Exception:
+            pass
+        if not t:
+            return 0.0
+        return max(0.0, PAPER_MIN_HOLD_DAYS - (time.time() - t) / 86400.0)
+    except Exception:
+        return 0.0
+
 def crash_active(regime):
     """True when SPY is at least CRASH_SPY_BELOW_PCT under its own 20-day average."""
     try:
@@ -2466,6 +2497,10 @@ def auto_scan():
                     continue
                 if symbol in engine_state.get('crash_state', {}):
                     log_scan(f"🧯 {symbol} — AI sell signal ignored: it's a crash-mode position (exits: bounce target, stops, or the time limit)")
+                    continue
+                hold_left = _paper_hold_left_days(symbol)
+                if hold_left > 0:
+                    log_scan(f"⏳ {symbol} — SELL signal ignored: minimum hold of {PAPER_MIN_HOLD_DAYS:g} days, {hold_left:.1f} to go (stop-loss, profit-taking and trailing stop still active)")
                     continue
                 left = cooldown_left(symbol, 'buy')
                 if left > 0:

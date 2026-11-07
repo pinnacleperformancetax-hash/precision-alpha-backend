@@ -1779,6 +1779,8 @@ def check_and_sell_positions():
                 # more (doubling the short). Shorting is disabled; cover manually.
                 log_scan(f"⚠️ {symbol} — short position ({pos.get('qty')}), skipping auto-sell; cover manually")
                 continue
+            if _OCC_RE.match(symbol or ''):
+                continue          # option contracts have their own exit rules (hedge_manage), not the stock stops
             held_symbols.add(symbol)
 
             r = rules_for(symbol)  # this stock's rules (its own level if it has an override)
@@ -2391,6 +2393,172 @@ def crash_scan(regime):
         log_scan(f"⚠️ Crash mode error: {type(e).__name__}: {str(e)[:80]}")
         return False
 
+# ---------------------------------------------------------------------------
+# CRASH HEDGE: SPY PUT (PAPER engine only). When crash mode is active the engine buys ONE put on SPY (a bet that
+# the market keeps falling; the most you can lose is what you pay). Chosen: expiry about HEDGE_DTE (35) days out,
+# strike about 1.5% under the SPY price, at most HEDGE_MAX_COST dollars per contract, tight bid/ask only.
+# Exits (checked every scan): +HEDGE_TP_PCT% gain (60), -HEDGE_STOP_PCT% loss (50), 7 days before expiry,
+# or when the crash is over (SPY back above its 20-day average). One hedge at a time; HEDGE_COOLDOWN_DAYS (5)
+# between buys. Env: HEDGE_PUTS=0 turns it off. Live account and customers are never touched.
+# ---------------------------------------------------------------------------
+HEDGE_PUTS = os.environ.get("HEDGE_PUTS", "1").strip() != "0"
+HEDGE_DTE = _trail_num("HEDGE_DTE", 35)
+HEDGE_MAX_COST = _trail_num("HEDGE_MAX_COST", 400)
+HEDGE_TP_PCT = _trail_num("HEDGE_TP_PCT", 60)
+HEDGE_STOP_PCT = _trail_num("HEDGE_STOP_PCT", 50)
+HEDGE_COOLDOWN_DAYS = _trail_num("HEDGE_COOLDOWN_DAYS", 5)
+
+def _occ_expiry(sym):
+    try:
+        return datetime.strptime(sym[-15:-9], "%y%m%d").date()
+    except Exception:
+        return None
+
+def _opt_quote(sym):
+    """(bid, ask) for one option contract, or (None, None)."""
+    try:
+        r = requests.get(f"{ALPACA_OPTIONS_DATA_URL}/options/snapshots", headers=alpaca_hdrs(), params={'symbols': sym}, timeout=10)
+        q = (r.json().get('snapshots', {}).get(sym) or {}).get('latestQuote') or {} if r.ok else {}
+        bp, ap = q.get('bp'), q.get('ap')
+        return (float(bp) if bp else None), (float(ap) if ap else None)
+    except Exception:
+        return None, None
+
+def hedge_pick(spy_price, contracts, today):
+    """Pure rule: from Alpaca contract dicts choose the put nearest HEDGE_DTE days out whose strike is nearest
+    1.5% under the SPY price. Returns the contract symbol or None."""
+    best, best_key = None, None
+    for c in contracts:
+        try:
+            if str(c.get('type', '')).lower() != 'put' or c.get('tradable') is False:
+                continue
+            exp = datetime.strptime(str(c['expiration_date'])[:10], "%Y-%m-%d").date()
+            dte = (exp - today).days
+            if dte < 21 or dte > 60:
+                continue
+            k = abs(float(c['strike_price']) - spy_price * 0.985)
+            key = (abs(dte - HEDGE_DTE) // 7, k)
+            if best_key is None or key < best_key:
+                best, best_key = c['symbol'], key
+        except Exception:
+            continue
+    return best
+
+def hedge_manage(regime=None):
+    """Exit rules for open SPY put hedges. Returns number of sells placed."""
+    n = 0
+    try:
+        res = requests.get(f"{ALPACA_BASE_URL}/positions", headers=alpaca_hdrs(), timeout=10)
+        if not res.ok:
+            return 0
+        crash_over = False
+        try:
+            reg = regime or get_market_regime()
+            crash_over = reg.get('trend') == 'bull' or (reg.get('spy_price') and reg.get('spy_sma20') and float(reg['spy_price']) >= float(reg['spy_sma20']))
+        except Exception:
+            pass
+        today = datetime.now(pytz.timezone('America/New_York')).date()
+        for pos in res.json():
+            sym = pos.get('symbol') or ''
+            if not _OCC_RE.match(sym) or sym[-9] != 'P' or float(pos.get('qty', 0) or 0) <= 0:
+                continue
+            entry, cur = float(pos.get('avg_entry_price', 0) or 0), float(pos.get('current_price', 0) or 0)
+            if entry <= 0:
+                continue
+            pct = (cur - entry) / entry * 100
+            exp = _occ_expiry(sym)
+            why = None
+            if pct >= HEDGE_TP_PCT:
+                why = f"take profit: put is up {pct:.0f}%"
+            elif pct <= -HEDGE_STOP_PCT:
+                why = f"stop: put is down {pct:.0f}%"
+            elif exp and (exp - today).days <= 7:
+                why = "expires within 7 days"
+            elif crash_over:
+                why = "the sell-off is over (SPY back above its 20-day average)"
+            if not why or not is_market_hours():
+                continue
+            bid, ask = _opt_quote(sym)
+            limit = round(bid if bid else cur * 0.97, 2)
+            qty = int(float(pos.get('qty')))
+            o = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(),
+                json={"symbol": sym, "qty": str(qty), "side": "sell", "type": "limit", "limit_price": str(max(limit, 0.01)), "time_in_force": "day"}, timeout=10)
+            if o.ok:
+                n += 1
+                pl = (cur - entry) * 100 * qty
+                entry_txt = f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · HEDGE SELL: {qty}x {sym} (limit ${limit:.2f}) · {why} · about ${pl:+.0f}"
+                engine_state['trade_log'].insert(0, entry_txt)
+                engine_state['trade_log'] = engine_state['trade_log'][:50]
+                log_scan(f"🛡️ Sold SPY put hedge {sym}: {why}")
+                log_customer(f"🛡️ Closed the SPY put hedge: {why}.")
+                save_state()
+            else:
+                log_scan(f"❌ Hedge sell failed for {sym}: {o.text[:80]}")
+    except Exception as e:
+        log_scan(f"⚠️ Hedge manage error: {type(e).__name__}: {str(e)[:80]}")
+    return n
+
+def hedge_scan(regime):
+    """During crash mode, buy one SPY put if none is open and none was bought in the last HEDGE_COOLDOWN_DAYS."""
+    try:
+        if not HEDGE_PUTS or not is_market_hours():
+            return False
+        hs = engine_state.setdefault('hedge_state', {})
+        if time.time() - float(hs.get('last_buy') or 0) < HEDGE_COOLDOWN_DAYS * 86400:
+            return False
+        pr = requests.get(f"{ALPACA_BASE_URL}/positions", headers=alpaca_hdrs(), timeout=10)
+        if not pr.ok:
+            return False
+        if any(_OCC_RE.match(p.get('symbol') or '') and (p.get('symbol') or '')[-9] == 'P' for p in pr.json()):
+            return False
+        spy = float(regime.get('spy_price') or 0)
+        if spy <= 0:
+            return False
+        today = datetime.now(pytz.timezone('America/New_York')).date()
+        cr = requests.get(f"{ALPACA_BASE_URL}/options/contracts", headers=alpaca_hdrs(), timeout=15, params={
+            'underlying_symbols': 'SPY', 'type': 'put', 'status': 'active', 'limit': 1000,
+            'expiration_date_gte': (today + timedelta(days=21)).isoformat(), 'expiration_date_lte': (today + timedelta(days=60)).isoformat(),
+            'strike_price_gte': round(spy * 0.95), 'strike_price_lte': round(spy)})
+        if not cr.ok:
+            log_scan(f"🛡️ Hedge: could not load SPY put contracts (HTTP {cr.status_code}). Options may not be enabled on this account.")
+            return False
+        sym = hedge_pick(spy, cr.json().get('option_contracts', []), today)
+        if not sym:
+            log_scan("🛡️ Hedge: no suitable SPY put found this scan")
+            return False
+        bid, ask = _opt_quote(sym)
+        if not bid or not ask or ask <= 0:
+            log_scan(f"🛡️ Hedge: no live quote for {sym}, skipping")
+            return False
+        mid = (bid + ask) / 2
+        if (ask - bid) / mid > 0.15:
+            log_scan(f"🛡️ Hedge: {sym} bid/ask too wide (${bid:.2f}/${ask:.2f}), skipping")
+            return False
+        cost = ask * 100
+        if cost > HEDGE_MAX_COST:
+            log_scan(f"🛡️ Hedge: {sym} costs ${cost:.0f} per contract, over the ${HEDGE_MAX_COST:g} limit, skipping")
+            return False
+        blocked = capital_cap_blocks(cost)
+        if blocked:
+            log_scan(f"🛡️ Hedge — trading-account cap: {blocked}")
+            return False
+        o = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(), timeout=10,
+            json={"symbol": sym, "qty": "1", "side": "buy", "type": "limit", "limit_price": str(round(ask, 2)), "time_in_force": "day"})
+        if not o.ok:
+            log_scan(f"❌ Hedge order failed: {o.text[:100]}")
+            return False
+        hs['last_buy'] = time.time()
+        entry = f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · HEDGE BUY: 1x {sym} @ ${ask:.2f} (cost ${cost:.0f}) · SPY put while the S&P is in a sell-off"
+        engine_state['trade_log'].insert(0, entry)
+        engine_state['trade_log'] = engine_state['trade_log'][:50]
+        log_customer(f"🛡️ Crash hedge: bought 1 SPY put (cost about ${cost:.0f}, the most it can lose). It gains if the market keeps falling.")
+        log_scan(f"🚀 ORDER PLACED (HEDGE): BUY 1x {sym} @ ${ask:.2f}")
+        save_state()
+        return True
+    except Exception as e:
+        log_scan(f"⚠️ Hedge error: {type(e).__name__}: {str(e)[:80]}")
+        return False
+
 def auto_scan():
     reset_if_needed()
     sweep_vault_if_due()
@@ -2418,8 +2586,10 @@ def auto_scan():
         if market_regime.get('spy_price') else ""
     ))
 
+    hedge_manage(market_regime)
     if crash_active(market_regime) and not no_buy_now:
         crash_scan(market_regime)
+        hedge_scan(market_regime)
 
     log_scan(f"🔍 Scanning {len(MARKET_SCAN_LIST)} stocks...")
     for symbol in MARKET_SCAN_LIST:

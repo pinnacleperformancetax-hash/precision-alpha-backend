@@ -4592,14 +4592,21 @@ def backtest_swing_route():
         bars = _bt_load_bars(2)
         if not bars.get("SPY") or len(bars["SPY"]) < 150:
             return jsonify({"error": "Not enough price history returned"}), 502
-        reports = [
-            robustness_report(bars, "Current style: 2 of 3 signals · strict filter · sells on a trend break any day (max 10 days)",
-                              strategy="technical", min_signals=2),
-            robustness_report(bars, "Swing style A: same buys, but no trend-break sell before 3 days (stop-loss still active, max 10 days)",
-                              strategy="technical", min_signals=2, min_hold_days=3),
-            robustness_report(bars, "Swing style B: same buys, no trend-break sell before 5 days, up to 20 days",
-                              strategy="technical", min_signals=2, min_hold_days=5, max_hold_days=20),
+        variants = [
+            ("Current style: 2 of 3 signals · strict market filter (no buys while the S&P is falling)", dict(strategy="technical", min_signals=2)),
+            ("Buy-the-dip A: sharp dips (RSI under 30), but only while the S&P is above its 20-day average", dict(strategy="mean_reversion")),
+            ("Buy-the-dip B: same dips, market filter OFF (buys through sell-offs and crashes)", dict(strategy="mean_reversion", use_regime=False)),
+            ("Buy-the-dip C: filter OFF + 5% circuit breaker (pauses buying 10 days after a 5% account drop)", dict(strategy="mean_reversion", use_regime=False, breaker_pct=5.0)),
+            ("Buy-the-dip D: filter OFF + wider 7% stop (dips often keep falling before they bounce)", dict(strategy="mean_reversion", use_regime=False, stop_pct=7.0)),
         ]
+        v = request.args.get("v")
+        if v is not None:
+            i = int(v)
+            if not 0 <= i < len(variants):
+                return jsonify({"error": "bad variant"}), 400
+            reports = [robustness_report(bars, variants[i][0], **variants[i][1])]
+        else:
+            reports = [robustness_report(bars, n, **kw) for n, kw in variants]
         return jsonify({"days": len(bars["SPY"]), "reports": reports,
                         "notes": ["Swing styles keep the same buy rules and the same 4% stop-loss; only the sell timing changes.",
                                   "Technical rules only; sentiment and AI sells cannot be replayed on past data, and the live engine's AI sells are what cut many trades short.",
@@ -4931,6 +4938,160 @@ def _sim_summary(st):
     return {"cash": sim.get("cash"), "realized": sim.get("realized", 0.0),
             "positions": [{"symbol": k, "qty": v["qty"], "avg": v["avg"]} for k, v in sim["pos"].items()]}
 
+# ===========================================================================
+# Approval gate (live account only). With LIVE_APPROVAL=1, a BUY bigger than LIVE_APPROVAL_MIN dollars (default 50)
+# is not sent. It becomes a proposal, an email goes to the owner with Approve / Decline buttons, and the order is
+# placed only if she approves within LIVE_APPROVAL_MINUTES (default 30). Smaller buys, and ALL sells/stops, stay
+# automatic. Email goes out through Resend (RESEND_API_KEY in Render). Off unless LIVE_APPROVAL=1.
+# ===========================================================================
+import hmac as _hmac, hashlib as _hashlib, secrets as _secrets, html as _html
+from flask import Response as _Resp
+LIVE_APPROVAL = os.environ.get("LIVE_APPROVAL", "").strip() == "1"
+LIVE_APPROVAL_MIN = float(os.environ.get("LIVE_APPROVAL_MIN", "").strip() or 50)
+LIVE_APPROVAL_MINUTES = float(os.environ.get("LIVE_APPROVAL_MINUTES", "").strip() or 30)
+APPROVAL_BLOCK_HOURS = 4          # after a decline or expiry, don't propose the same stock again for this long
+APPROVAL_EMAIL_TO = os.environ.get("APPROVAL_EMAIL_TO", "").strip() or "pinnacleperformancetax@gmail.com"
+APPROVAL_EMAIL_FROM = os.environ.get("APPROVAL_EMAIL_FROM", "").strip() or "Precision Alpha <onboarding@resend.dev>"
+APPROVAL_BASE_URL = (os.environ.get("APPROVAL_BASE_URL", "").strip() or "https://api.precisionalphaai.com").rstrip("/")
+approvals = {"items": {}, "blocked": {}, "lock": threading.Lock()}
+
+def _appr_token(pid):
+    key = (os.environ.get("APPROVAL_SECRET", "").strip() or LIVE_SECRET or "x").encode()
+    return _hmac.new(key, pid.encode(), _hashlib.sha256).hexdigest()[:32]
+
+def _appr_send_email(it):
+    key = os.environ.get("RESEND_API_KEY", "").strip()
+    if not key:
+        return False, "RESEND_API_KEY is not set in Render"
+    link = f"{APPROVAL_BASE_URL}/approve/{it['id']}?t={_appr_token(it['id'])}"
+    body = (f"<div style='font-family:Arial,sans-serif;max-width:480px'>"
+            f"<h2>Buy {_html.escape(it['sym'])}? ${it['dollars']:.2f}</h2>"
+            f"<p>Price about ${it['price']:.2f}. {it['agreeing']} of {it['total']} signals agree.<br>"
+            f"Live account. Expires in {int(LIVE_APPROVAL_MINUTES)} minutes; nothing is bought unless you approve.</p>"
+            f"<p><a href='{link}' style='background:#1a7f37;color:#fff;padding:12px 22px;border-radius:6px;text-decoration:none'>Review and decide</a></p>"
+            f"</div>")
+    try:
+        r = requests.post("https://api.resend.com/emails", timeout=10,
+                          headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                          json={"from": APPROVAL_EMAIL_FROM, "to": [APPROVAL_EMAIL_TO],
+                                "subject": f"Approve buy: {it['sym']} ${it['dollars']:.0f}", "html": body})
+        return (True, "") if r.ok else (False, f"email service said {r.status_code}: {r.text[:100]}")
+    except Exception as e:
+        return False, f"email failed ({type(e).__name__})"
+
+def approval_propose(st, pre, sym, dollars, price, agreeing, total):
+    """Queue a big live buy for approval. Returns True if a proposal exists (new or already waiting)."""
+    now = time.time()
+    with approvals["lock"]:
+        for it in approvals["items"].values():
+            if it["sym"] == sym and it["status"] == "pending":
+                if now < it["expires"]:
+                    return True
+                it["status"] = "expired"          # no answer in time: drop it and don't ask again for a while
+                approvals["blocked"][sym] = now
+        if now - approvals["blocked"].get(sym, 0) < APPROVAL_BLOCK_HOURS * 3600:
+            return True
+        it = {"id": _secrets.token_hex(6), "sym": sym, "dollars": float(dollars), "price": float(price), "agreeing": agreeing,
+              "total": total, "created": now, "expires": now + LIVE_APPROVAL_MINUTES * 60, "status": "pending"}
+        approvals["items"][it["id"]] = it
+        for k in [k for k, v in approvals["items"].items() if now - v["created"] > 86400]:
+            approvals["items"].pop(k, None)
+    ok, why = _appr_send_email(it)
+    if ok:
+        _cust_log(st, f"📨 Waiting for your OK: buy ${dollars:.2f} of {sym} at about ${price:.2f}. Email sent; expires in {int(LIVE_APPROVAL_MINUTES)} min.")
+    else:
+        _cust_log(st, f"⚠️ Wanted to buy ${dollars:.2f} of {sym} but could not email you ({why}). Not bought.")
+    return True
+
+def _appr_log(msg):
+    try:
+        uid = _live_state_uid()
+        if uid:
+            st = _cust_state_load(uid)
+            _cust_log(st, msg)
+            _cust_state_save(uid, st)
+    except Exception:
+        pass
+
+def approval_execute(it):
+    """Run when the owner approves. Re-checks the live limits, then places the order. Returns (ok, message)."""
+    sym, dollars = it["sym"], it["dollars"]
+    if time.time() > it["expires"]:
+        return False, "This request expired, so nothing was bought."
+    if not is_market_hours():
+        return False, "The market is closed right now, so nothing was bought."
+    if live_engine.get("paused") or not _live_ready():
+        return False, "Live trading is paused, so nothing was bought."
+    conn = live_conn()
+    try:
+        uid = _live_state_uid()
+        st = _cust_state_load(uid) if uid else {}
+        if (st.get("breaker") or {}).get("tripped"):
+            return False, "The loss circuit breaker is on, so nothing was bought."
+        a = requests.get(f"{conn['base']}/account", headers=conn["hdrs"], timeout=10).json()
+        pos = requests.get(f"{conn['base']}/positions", headers=conn["hdrs"], timeout=10).json()
+        pos = pos if isinstance(pos, list) else []
+        invested = sum(float(p.get("market_value", 0) or 0) for p in pos)
+        cur = sum(float(p.get("market_value", 0) or 0) for p in pos if p.get("symbol") == sym)
+        if invested + dollars > LIVE_CAPS["max_invested"] + 0.01:
+            return False, f"That would go over the ${LIVE_CAPS['max_invested']:g} total-invested limit, so nothing was bought."
+        if cur + dollars > LIVE_CAPS["max_position"] + 0.01:
+            return False, f"That would go over the ${LIVE_CAPS['max_position']:g} per-stock limit, so nothing was bought."
+        if float(a.get("buying_power", 0) or 0) < dollars:
+            return False, "Not enough buying power, so nothing was bought."
+        sigp = (_cust_shared.get("signals") or {}).get(sym, {}).get("price")
+        if sigp and it["price"] and abs(float(sigp) - it["price"]) / it["price"] > 0.03:
+            return False, f"{sym} moved more than 3% since the request, so nothing was bought."
+    except Exception as e:
+        return False, f"Could not check the account ({type(e).__name__}), so nothing was bought."
+    if LIVE_FRACTIONAL:
+        ok = _cust_order(conn, sym, round(dollars / it["price"], 6), "buy", notional=dollars)
+    else:
+        qty = max(1, int(dollars / it["price"]))
+        ok = _cust_order(conn, sym, qty, "buy")
+    if ok:
+        _appr_log(f"🟢 You approved: bought ${dollars:.2f} of {sym} at about ${it['price']:.2f}.")
+        return True, f"Done. Order sent: ${dollars:.2f} of {sym}."
+    return False, f"Alpaca did not accept the order. {conn.get('last_err') or ''}"
+
+def _appr_page(title, msg, buttons=""):
+    h = (f"<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><title>{_html.escape(title)}</title>"
+         f"<body style='font-family:Arial,sans-serif;max-width:440px;margin:40px auto;padding:0 16px'>"
+         f"<h2>{_html.escape(title)}</h2><p>{msg}</p>{buttons}</body>")
+    return _Resp(h, mimetype="text/html")
+
+@app.route("/approve/<pid>", methods=["GET", "POST"])
+def approve_route(pid):
+    it = approvals["items"].get(pid)
+    t = request.args.get("t", "") or request.form.get("t", "")
+    if not it or not _hmac.compare_digest(t, _appr_token(pid)):
+        return _appr_page("Not found", "This link is not valid or the server restarted. Nothing was bought."), 404
+    if request.method == "GET":
+        if it["status"] != "pending" or time.time() > it["expires"]:
+            return _appr_page(f"{it['sym']}: closed", "This request already ran or expired. Nothing more will happen.")
+        left = max(0, int((it["expires"] - time.time()) / 60))
+        btn = (f"<form method=post style='display:inline'><input type=hidden name=t value='{t}'>"
+               f"<button name=a value=yes style='background:#1a7f37;color:#fff;border:0;padding:14px 26px;border-radius:6px;font-size:16px'>Approve</button> "
+               f"<button name=a value=no style='background:#b42318;color:#fff;border:0;padding:14px 26px;border-radius:6px;font-size:16px'>Decline</button></form>")
+        return _appr_page(f"Buy {it['sym']}?", f"${it['dollars']:.2f} at about ${it['price']:.2f} in your live account.<br>"
+                          f"{it['agreeing']} of {it['total']} signals agree. About {left} min left.", btn)
+    with approvals["lock"]:
+        if it["status"] != "pending":
+            return _appr_page(f"{it['sym']}: already {it['status']}", "Nothing more will happen.")
+        yes = request.form.get("a") == "yes"
+        it["status"] = "running" if yes else "declined"
+        if not yes:
+            approvals["blocked"][it["sym"]] = time.time()
+    if not yes:
+        _appr_log(f"✋ You declined the buy of {it['sym']}. Not bought.")
+        return _appr_page("Declined", f"{_html.escape(it['sym'])} will not be bought. The app will not suggest it again for {APPROVAL_BLOCK_HOURS} hours.")
+    ok, msg = approval_execute(it)
+    it["status"] = "approved" if ok else "failed"
+    approvals["blocked"][it["sym"]] = time.time()
+    if not ok:
+        _appr_log(f"⚠️ Approved buy of {it['sym']} did not go through: {msg}")
+    return _appr_page("Approved" if ok else "Not bought", _html.escape(msg))
+
 def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None):
     """One pass for one customer on their own paper account."""
     r, offset = _cust_rules(level)
@@ -5171,6 +5332,11 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                     continue
             else:
                 order_qty = 1
+            if caps and side == "buy" and LIVE_APPROVAL and not conn.get("dry"):
+                _est = buy_dollars if frac else price
+                if _est > LIVE_APPROVAL_MIN:
+                    approval_propose(st, pre, sym, _est, price, agreeing, total)
+                    continue          # wait for the owner; smaller buys on other stocks may still go through
             if _cust_order(conn, sym, order_qty, side, notional=buy_dollars if (frac and side == "buy") else None):
                 if conn.get("dry"): _sim_apply(st, sym, order_qty, side, price)
                 st["cooldowns"].setdefault(sym, {})[side] = time.time()
@@ -5406,6 +5572,7 @@ def live_status():
            "paused": live_engine["paused"], "risk_level": LIVE_RISK, "caps": LIVE_CAPS, "min_hold_minutes": LIVE_MIN_HOLD_MINUTES,
            "no_buy_last_minutes": LIVE_NO_BUY_LAST_MINUTES, "no_buy_after": _cutoff_label(LIVE_NO_BUY_AFTER_MIN),
            "fractional": LIVE_FRACTIONAL, "frac_chunk": LIVE_FRAC_CHUNK,
+           "approval": {"on": LIVE_APPROVAL, "over_dollars": LIVE_APPROVAL_MIN, "minutes": LIVE_APPROVAL_MINUTES, "email_key_set": bool(os.environ.get("RESEND_API_KEY", "").strip())},
            "last_cycle": live_engine["last_cycle"], "last_error": live_engine["last_error"]}
     if _live_ready():
         try:

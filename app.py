@@ -1774,6 +1774,8 @@ def check_and_sell_positions():
 
             if qty == 0:
                 continue
+            if _OCC_RE.match(symbol or ''):
+                continue          # option contracts have their own exit rules (hedge / covered-call code)
             if float(pos.get('qty', 0)) < 0:
                 # Short positions: this logic assumes a long and would SELL
                 # more (doubling the short). Shorting is disabled; cover manually.
@@ -2559,6 +2561,154 @@ def hedge_scan(regime):
         log_scan(f"⚠️ Hedge error: {type(e).__name__}: {str(e)[:80]}")
         return False
 
+# ---------------------------------------------------------------------------
+# COVERED CALLS / BUY-WRITE (PAPER engine only). A covered call needs 100 shares, and the normal engine never holds
+# that many, so this is its own small program: buy 100 shares of ONE cheap, liquid ETF (CC_SYMBOLS), then sell one
+# call about 30 days out and about 3% above the price. You keep the premium; if the price ends above the strike the
+# shares are sold at that strike (you give up gains above it). The risk is the shares falling (premium only cushions).
+# Rules: only when the market is not in a downtrend; the call must pay at least CC_MIN_PREMIUM_PCT (0.6) of the
+# share price with a tight bid/ask; one program at a time; shares cost at most CC_MAX_COST ($6,000).
+# Exits: buy the call back when 75% of the premium is earned, or if the shares fall by the stop-loss % (then the
+# normal stop sells the shares on the next scan). Env: COVERED_CALLS=0 turns it off.
+# ---------------------------------------------------------------------------
+COVERED_CALLS = os.environ.get("COVERED_CALLS", "1").strip() != "0"
+CC_SYMBOLS = [x.strip().upper() for x in (os.environ.get("CC_SYMBOLS", "").strip() or "XLF,XLU,XLE,KRE,EEM").split(",") if x.strip()]
+CC_MAX_COST = _trail_num("CC_MAX_COST", 6000)
+CC_MIN_PREMIUM_PCT = _trail_num("CC_MIN_PREMIUM_PCT", 0.6)
+CC_TAKE_PCT = _trail_num("CC_TAKE_PCT", 75)
+
+def cc_pick_call(price, contracts, today):
+    """Pure rule: the call nearest 30 days out whose strike is nearest 3% above the price (never under 2% above)."""
+    best, best_key = None, None
+    for c in contracts:
+        try:
+            if str(c.get('type', '')).lower() != 'call' or c.get('tradable') is False:
+                continue
+            dte = (datetime.strptime(str(c['expiration_date'])[:10], "%Y-%m-%d").date() - today).days
+            k = float(c['strike_price'])
+            if dte < 21 or dte > 45 or k < price * 1.02:
+                continue
+            key = (abs(dte - 30) // 7, abs(k - price * 1.03))
+            if best_key is None or key < best_key:
+                best, best_key = c['symbol'], key
+        except Exception:
+            continue
+    return best
+
+def _cc_contracts(root, price, today):
+    r = requests.get(f"{ALPACA_BASE_URL}/options/contracts", headers=alpaca_hdrs(), timeout=15, params={
+        'underlying_symbols': root, 'type': 'call', 'status': 'active', 'limit': 1000,
+        'expiration_date_gte': (today + timedelta(days=21)).isoformat(), 'expiration_date_lte': (today + timedelta(days=45)).isoformat(),
+        'strike_price_gte': round(price * 1.02, 2), 'strike_price_lte': round(price * 1.08, 2)})
+    return r.json().get('option_contracts', []) if r.ok else []
+
+def cc_run(regime):
+    """One pass of the covered-call program. Returns a short status string (for tests)."""
+    if not COVERED_CALLS or not is_market_hours():
+        return "off"
+    try:
+        today = datetime.now(pytz.timezone('America/New_York')).date()
+        pr = requests.get(f"{ALPACA_BASE_URL}/positions", headers=alpaca_hdrs(), timeout=10)
+        if not pr.ok:
+            return "no positions"
+        shares, shorts = {}, {}
+        for p in pr.json():
+            sym, q = p.get('symbol') or '', float(p.get('qty', 0) or 0)
+            if _OCC_RE.match(sym):
+                if sym[-9] == 'C' and q < 0:
+                    shorts[sym[:-15]] = p
+            elif sym in CC_SYMBOLS and q > 0:
+                shares[sym] = p
+        cs = engine_state.setdefault('cc_state', {})
+        # 1) manage short calls
+        for root, p in shorts.items():
+            sym = p['symbol']
+            credit, cur = float(p.get('avg_entry_price', 0) or 0), float(p.get('current_price', 0) or 0)
+            sh = shares.get(root)
+            why = None
+            if credit > 0 and cur <= credit * (1 - CC_TAKE_PCT / 100.0):
+                why = f"{CC_TAKE_PCT:g}% of the premium is earned"
+            elif sh and float(sh.get('avg_entry_price', 0) or 0) > 0:
+                loss = (float(sh['current_price']) - float(sh['avg_entry_price'])) / float(sh['avg_entry_price']) * 100
+                if loss <= -RULES['maxLossPct']:
+                    why = f"the shares are down {loss:.1f}% (stop-loss); closing the call so the shares can be sold"
+            if why:
+                bid, ask = _opt_quote(sym)
+                lim = round(ask if ask else cur * 1.05, 2)
+                o = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(), timeout=10,
+                    json={"symbol": sym, "qty": str(int(abs(float(p['qty'])))), "side": "buy", "type": "limit", "limit_price": str(max(lim, 0.01)), "time_in_force": "day"})
+                if o.ok:
+                    cs['last_close'] = time.time()
+                    log_scan(f"🧾 Covered call {sym} bought back: {why}")
+                    log_customer(f"🧾 Closed the covered call on {root}: {why}.")
+                    engine_state['trade_log'].insert(0, f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · CALL BUY-BACK: {sym} (limit ${lim:.2f}) · {why}")
+                    engine_state['trade_log'] = engine_state['trade_log'][:50]
+                    save_state()
+                return "managed"
+        if shorts:
+            return "call open"
+        # 2) have 100+ shares, no call yet: sell one
+        for root, p in shares.items():
+            if float(p['qty']) >= 100:
+                price = float(p.get('current_price', 0) or 0)
+                sym = cc_pick_call(price, _cc_contracts(root, price, today), today)
+                bid, ask = _opt_quote(sym) if sym else (None, None)
+                if not sym or not bid or not ask or (ask - bid) / ((ask + bid) / 2) > 0.15 or bid / price * 100 < CC_MIN_PREMIUM_PCT:
+                    log_scan(f"🧾 Covered call: {root} shares held, but no call pays enough with a tight bid/ask right now")
+                    return "waiting for a good call"
+                lim = round((bid + ask) / 2, 2)
+                o = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(), timeout=10,
+                    json={"symbol": sym, "qty": "1", "side": "sell", "type": "limit", "limit_price": str(lim), "time_in_force": "day"})
+                if o.ok:
+                    log_scan(f"🚀 ORDER PLACED (COVERED CALL): SELL 1x {sym} @ ${lim:.2f} against 100 {root}")
+                    log_customer(f"🧾 Sold a covered call on {root} for about ${lim * 100:.0f}. If {root} ends above the strike the shares are sold there.")
+                    engine_state['trade_log'].insert(0, f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · COVERED CALL: sold 1x {sym} @ ${lim:.2f} (premium ${lim * 100:.0f}) against 100 {root}")
+                    engine_state['trade_log'] = engine_state['trade_log'][:50]
+                    save_state()
+                    return "sold call"
+                log_scan(f"❌ Covered call order failed: {o.text[:100]}")
+                return "order failed"
+        if shares:
+            if time.time() - float(cs.get('bought') or 0) < 86400:
+                return "waiting for shares to fill"
+            return "leftover shares (under 100) are managed by the normal rules"
+        # 3) nothing running: maybe start one (buy 100 shares of the first symbol with a good call)
+        if regime.get('trend') == 'bear' or _paper_buy_cutoff_passed():
+            return "not now"
+        if time.time() - float(cs.get('last_close') or 0) < 86400:
+            return "cooling down"
+        for root in CC_SYMBOLS:
+            qr = requests.get(f"{ALPACA_DATA_URL}/stocks/{root}/trades/latest", headers=alpaca_hdrs(), timeout=10)
+            price = qr.json().get('trade', {}).get('p', 0) if qr.ok else 0
+            if not price or price * 100 > CC_MAX_COST:
+                continue
+            sym = cc_pick_call(price, _cc_contracts(root, price, today), today)
+            bid, ask = _opt_quote(sym) if sym else (None, None)
+            if not sym or not bid or not ask or (ask - bid) / ((ask + bid) / 2) > 0.15 or bid / price * 100 < CC_MIN_PREMIUM_PCT:
+                continue
+            if capital_cap_blocks(price * 100):
+                log_scan(f"🧾 Covered call: trading-account cap blocks buying 100 {root}")
+                return "capped"
+            lim = round(price * 1.002, 2)
+            o = requests.post(f"{ALPACA_BASE_URL}/orders", headers=alpaca_hdrs(), timeout=10,
+                json={"symbol": root, "qty": "100", "side": "buy", "type": "limit", "limit_price": str(lim), "time_in_force": "day"})
+            if o.ok:
+                note_trade(root, 'buy')
+                cs['bought'] = time.time()
+                log_scan(f"🚀 ORDER PLACED (COVERED-CALL SHARES): BUY 100 {root} @ ${price:.2f}; the call is sold once the shares fill (next scan)")
+                log_customer(f"🧾 Covered-call program: bought 100 {root} (about ${price * 100:.0f}). Next scan sells a call against them.")
+                engine_state['trade_log'].insert(0, f"{datetime.now(pytz.timezone('America/New_York')).strftime('%I:%M %p')} · COVERED-CALL SHARES: BUY 100 {root} @ ${price:.2f} (limit ${lim:.2f})")
+                engine_state['trade_log'] = engine_state['trade_log'][:50]
+                save_state()
+                return "bought shares"
+            log_scan(f"❌ Covered-call share order failed: {o.text[:100]}")
+            return "order failed"
+        log_scan("🧾 Covered call: no ETF on the list has a call that pays enough right now")
+        return "no candidate"
+    except Exception as e:
+        log_scan(f"⚠️ Covered call error: {type(e).__name__}: {str(e)[:80]}")
+        return "error"
+
 def auto_scan():
     reset_if_needed()
     sweep_vault_if_due()
@@ -2587,6 +2737,7 @@ def auto_scan():
     ))
 
     hedge_manage(market_regime)
+    cc_run(market_regime)
     if crash_active(market_regime) and not no_buy_now:
         crash_scan(market_regime)
         hedge_scan(market_regime)
@@ -4808,6 +4959,127 @@ def backtest_dips_route():
                                   "Technical rules only; sentiment and AI signals cannot be replayed on past data.",
                                   "Orders fill at the next day's open with 0.05% slippage per side; cash-account settlement delays are ignored.",
                                   "The 2 years of history include the April 2025 sell-off, so the 'filter OFF' rows show what buying through a crash actually did."]})
+    except Exception as e:
+        return _safe_err(e)
+
+
+# ---- Inverse-ETF test: would holding SH / PSQ while the S&P is in a downtrend have made money? ----
+_inv_cache = {}
+def _inv_fetch(sym, start):
+    out, token = [], None
+    for _ in range(5):
+        params = {"timeframe": "1Day", "start": start, "limit": 10000, "feed": "iex", "adjustment": "split"}
+        if token:
+            params["page_token"] = token
+        r = requests.get(f"{ALPACA_DATA_URL}/stocks/{sym}/bars", headers=alpaca_hdrs(), timeout=20, params=params)
+        if not r.ok:
+            break
+        j = r.json()
+        out += [{"d": b["t"][:10], "o": b["o"], "c": b["c"]} for b in (j.get("bars") or [])]
+        token = j.get("next_page_token")
+        if not token:
+            break
+    return out
+
+def inverse_backtest(spy, held, below_pct=0.0, capital=1000.0, slip_pct=0.05):
+    """Pure. spy: [{'d','o','c'}] oldest->newest. held: {symbol: bars} to hold in equal parts while ON.
+    ON when SPY's close is at least below_pct% under its 20-day average (signal at the close, fill at the next open);
+    OFF (cash) when it is back above the average. Returns daily equity and trade count."""
+    syms = list(held)
+    idx = {sym: {b["d"]: b for b in bars} for sym, bars in held.items()}
+    closes = [b["c"] for b in spy]
+    cash, pos, on, trades, eq = float(capital), {}, False, 0, []
+    slip = slip_pct / 100.0
+    want_next = False
+    for i, b in enumerate(spy):
+        d = b["d"]
+        if want_next != on:                         # act at today's open on yesterday's signal
+            if want_next:
+                part = cash / len(syms)
+                for sym in syms:
+                    bar = idx[sym].get(d)
+                    if bar and part > 0:
+                        px = bar["o"] * (1 + slip)
+                        pos[sym] = part / px; cash -= part
+                trades += 1
+            else:
+                for sym, q in list(pos.items()):
+                    bar = idx[sym].get(d)
+                    if bar:
+                        cash += q * bar["o"] * (1 - slip)
+                        pos.pop(sym)
+                trades += 1
+            on = want_next
+        val = cash + sum(q * (idx[sym].get(d) or {"c": 0})["c"] for sym, q in pos.items())
+        if pos and any(sym not in idx or d not in idx[sym] for sym in pos):
+            val = eq[-1][1] if eq else capital      # missing bar: carry yesterday's value
+        eq.append((d, val))
+        if i >= 19:
+            sma = sum(closes[i - 19:i + 1]) / 20
+            want_next = (sma - closes[i]) / sma * 100 >= below_pct and closes[i] < sma
+    return {"equity": eq, "trades": trades}
+
+def _inv_stats(eq, spy_closes_by_date):
+    vals = [v for _, v in eq]
+    peak, dd = vals[0], 0.0
+    for v in vals:
+        peak = max(peak, v); dd = max(dd, (peak - v) / peak * 100)
+    ret = (vals[-1] / vals[0] - 1) * 100
+    d0, d1 = eq[0][0], eq[-1][0]
+    spy_ret = (spy_closes_by_date[d1] / spy_closes_by_date[d0] - 1) * 100
+    return round(ret, 2), round(dd, 2), round(spy_ret, 2)
+
+@app.route("/api/backtest/inverse")
+@require_api_key
+def backtest_inverse_route():
+    """Read-only. ?v=0..3 runs one variant; ?years=2 or 4 (default 2)."""
+    try:
+        years = 4 if request.args.get("years") == "4" else 2
+        key = years
+        c = _inv_cache.get(key)
+        if not c or time.time() - c["ts"] > 3600:
+            start = (datetime.utcnow() - timedelta(days=int(365 * years) + 10)).strftime("%Y-%m-%dT00:00:00Z")
+            data = {}
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                for sym, bars in zip(("SPY", "SH", "PSQ"), ex.map(lambda x: _inv_fetch(x, start), ("SPY", "SH", "PSQ"))):
+                    data[sym] = bars
+            if len(data["SPY"]) < 150 or len(data["SH"]) < 150:
+                return jsonify({"error": "Not enough price history returned"}), 502
+            c = _inv_cache[key] = {"ts": time.time(), "data": data}
+        data = c["data"]
+        spy = data["SPY"]
+        common = set(b["d"] for b in spy) & set(b["d"] for b in data["SH"]) & set(b["d"] for b in data["PSQ"])
+        spy = [b for b in spy if b["d"] in common]
+        sh = [b for b in data["SH"] if b["d"] in common]; psq = [b for b in data["PSQ"] if b["d"] in common]
+        variants = [
+            ("A: hold SH (−1× the S&P) whenever the S&P is under its 20-day average", {"SH": sh}, 0.0),
+            ("B: hold SH only in a real sell-off (S&P at least 3% under its 20-day average)", {"SH": sh}, 3.0),
+            ("C: hold PSQ (−1× the Nasdaq) whenever the S&P is under its 20-day average", {"PSQ": psq}, 0.0),
+            ("D: hold half SH and half PSQ whenever the S&P is under its 20-day average", {"SH": sh, "PSQ": psq}, 0.0),
+        ]
+        v = request.args.get("v")
+        sel = [variants[int(v)]] if v is not None and 0 <= int(v) < len(variants) else variants
+        spyc = {b["d"]: b["c"] for b in spy}
+        reports = []
+        for name, held, below in sel:
+            res = inverse_backtest(spy, held, below)
+            eq = res["equity"]
+            ret, dd, spy_ret = _inv_stats(eq, spyc)
+            n = len(eq); step = n // 5
+            slices = []
+            for k in range(5):
+                part = eq[k * step:(k + 1) * step + (1 if k < 4 else 0)] if k < 4 else eq[k * step:]
+                if len(part) < 2:
+                    continue
+                r2, _, s2 = _inv_stats(part, spyc)
+                slices.append({"start": part[0][0], "end": part[-1][0], "return_pct": r2, "spy_pct": s2})
+            reports.append({"name": name, "return_pct": ret, "spy_pct": spy_ret, "max_drawdown_pct": dd,
+                            "switches": res["trades"], "days": n, "slices": slices,
+                            "positive_slices": sum(1 for x in slices if x["return_pct"] > 0)})
+        return jsonify({"years": years, "reports": reports,
+                        "notes": ["Holding rule uses the S&P's own 20-day average, the same line the engine uses for its market filter.",
+                                  "Signals use the close; orders fill at the next day's open with 0.05% slippage per side. Cash earns nothing.",
+                                  "SH and PSQ lose value over time in choppy markets; this test counts that. 'S&P' is simply buying and holding SPY over the same dates."]})
     except Exception as e:
         return _safe_err(e)
 

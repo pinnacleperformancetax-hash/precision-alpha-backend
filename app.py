@@ -2712,8 +2712,10 @@ def cc_run(regime):
 def auto_scan():
     reset_if_needed()
     sweep_vault_if_due()
+    _record_rule_version()
     if not is_market_hours():
         log_scan("⏰ Outside trading hours — scan skipped"); return
+    _sample_exposure()
 
     # ALWAYS check and sell positions first — even if daily loss limit hit
     check_and_sell_positions()
@@ -4446,12 +4448,25 @@ def compute_scorecard(equity_pts, spy_pts, fills, exposure_pts=None, source_of=N
                      "profit_factor": (round(v["gain"] / v["loss"], 2) if v["loss"] > 0 else None),
                      "avg_per_trade": round(v["pl"] / v["trades"], 2)} for k, v in by_src.items() if v["trades"]]
         src_rows.sort(key=lambda r: -r["trades"])
+        by_ver = {}
+        for c in closed:
+            k = _version_at(c.get("t_in")) or "before versioning began"
+            r = by_ver.setdefault(k, {"trades": 0, "pl": 0.0, "wins": 0, "gain": 0.0, "loss": 0.0})
+            r["trades"] += 1; r["pl"] += c["pl"]
+            if c["pl"] > 0:
+                r["wins"] += 1; r["gain"] += c["pl"]
+            else:
+                r["loss"] += -c["pl"]
+        ver_rows = [{"bucket": k, "trades": v["trades"], "pl": round(v["pl"], 2),
+                     "win_rate_pct": round(100.0 * v["wins"] / v["trades"], 1),
+                     "profit_factor": (round(v["gain"] / v["loss"], 2) if v["loss"] > 0 else None)} for k, v in by_ver.items() if v["trades"]]
         ranked = sorted(bysym.items(), key=lambda kv: kv[1])
         notional = sum(c["notional"] for c in closed)
         tot = sum(c["pl"] for c in closed)
         t["breakdown"] = {
             "by_hold": _rows(hb, order_h), "by_entry_time": _rows(eb, order_e),
             "by_source": src_rows,
+            "by_version": ver_rows,
             "hold_by_entry": [{"hold": h2, "entry": e2, "trades": v[0], "pl": round(v[1], 2),
                                "win_rate_pct": round(100.0 * v[2] / v[0], 1)}
                               for (h2, e2), v in sorted(mx.items(), key=lambda kv: (order_h.index(kv[0][0]), order_e.index(kv[0][1])))],
@@ -4462,6 +4477,8 @@ def compute_scorecard(equity_pts, spy_pts, fills, exposure_pts=None, source_of=N
             "after_costs": [{"bps": bp, "net": round(tot - notional * 2 * bp / 10000.0, 2)} for bp in (0, 5, 10, 20)],
         }
     out["trades"] = t
+    out["exposure"] = _exposure_summary()
+    out["rule_version"] = RULE_VERSION
     # readiness checks against the targets discussed (not a prediction)
     checks = []
     def chk(name, ok, detail):
@@ -5351,6 +5368,90 @@ def _cust_order(conn, sym, qty, side, notional=None):
         conn["last_err"] = f"Could not confirm with Alpaca ({type(e).__name__}). The order may or may not have gone through; the engine checks Alpaca's open orders and positions before trying again."
         return False
 
+# ---------------------------------------------------------------------------
+# Rule version, exposure sampling, and the live decision log
+# ---------------------------------------------------------------------------
+RULE_VERSION = os.environ.get("RULE_VERSION", "").strip() or "2026-11-12 pause-fix + order confirmation + data gate"
+
+def _record_rule_version():
+    """Remember when each rule version started, so the scorecard can split results by version. Idempotent."""
+    vl = engine_state.setdefault('version_log', [])
+    if not vl or vl[-1].get('version') != RULE_VERSION:
+        vl.append({'version': RULE_VERSION, 'since': datetime.utcnow().isoformat() + 'Z'})
+        del vl[:-40]
+        save_state()
+
+def _version_at(t_iso):
+    """Which rule version was running when a trade was opened (None if before versioning began)."""
+    try:
+        t = datetime.fromisoformat(str(t_iso).replace('Z', '+00:00')).replace(tzinfo=None)
+    except Exception:
+        return None
+    cur = None
+    for v in engine_state.get('version_log', []):
+        try:
+            if datetime.fromisoformat(v['since'].replace('Z', '+00:00')).replace(tzinfo=None) <= t:
+                cur = v['version']
+        except Exception:
+            continue
+    return cur
+
+def _sample_exposure():
+    """Once per scan (market hours): how much of the paper account is invested. Averages are kept per day."""
+    try:
+        r = requests.get(f"{ALPACA_BASE_URL}/account", headers=alpaca_hdrs(), timeout=10)
+        if not r.ok:
+            return
+        a = r.json()
+        eq, lmv = float(a.get('equity', 0) or 0), abs(float(a.get('long_market_value', 0) or 0))
+        if eq <= 0:
+            return
+        day = datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d')
+        ex = engine_state.setdefault('exposure_days', {})
+        d = ex.setdefault(day, {'n': 0, 'sum': 0.0})
+        d['n'] += 1
+        d['sum'] += lmv / eq * 100.0
+        for k in sorted(ex)[:-400]:
+            ex.pop(k, None)
+    except Exception:
+        pass
+
+def _exposure_summary():
+    ex = engine_state.get('exposure_days') or {}
+    if not ex:
+        return None
+    n = sum(v['n'] for v in ex.values())
+    if not n:
+        return None
+    return {'avg_pct': round(sum(v['sum'] for v in ex.values()) / n, 1), 'days': len(ex), 'since': min(ex)}
+
+def _dlog(st, conn, kind, why, sym, side, qty, price, regime=None, checks=None, signals=None):
+    """Live account: one traceable record per trade attempt (signals, checks, order id, outcome, exit reason)."""
+    try:
+        placed = conn.get("placed") or []
+        oid = placed[-1]["id"] if placed else None
+        age = time.time() - float(_cust_shared.get("ts") or 0)
+        d = {"t": datetime.utcnow().isoformat() + "Z", "sym": sym, "side": side, "kind": kind, "why": why,
+             "qty": qty, "price": round(float(price), 2), "order_id": oid, "version": RULE_VERSION,
+             "regime": (regime or {}).get("label") or (regime or {}).get("trend"), "data_age_s": round(age),
+             "checks": checks or [], "signals": signals or {}, "outcome": None}
+        ds = st.setdefault("decisions", [])
+        if side == "sell":
+            for b in ds:
+                if b.get("sym") == sym and b.get("side") == "buy" and not b.get("closed"):
+                    b.setdefault("exits", []).append({"t": d["t"], "kind": kind, "why": why})
+                    if kind in ("stop-loss", "profit-taking (final)", "AI sell signal"):
+                        b["closed"] = True
+        ds.append(d)
+        del ds[:-150]
+    except Exception:
+        pass
+
+def _dlog_outcome(st, order_id, status, fq, avg):
+    for d in st.get("decisions", []):
+        if d.get("order_id") == order_id:
+            d["outcome"] = {"status": status, "filled_qty": fq, "avg_price": round(avg, 4) if avg else None}
+
 _TRACK_FINAL = {"filled", "canceled", "expired", "rejected", "done_for_day", "replaced", "stopped", "suspended"}
 
 def _track_orders(st, conn):
@@ -5375,6 +5476,8 @@ def _track_orders(st, conn):
             continue
         status, fq = j.get("status"), float(j.get("filled_qty") or 0)
         avg = float(j.get("filled_avg_price") or 0)
+        if status in _TRACK_FINAL or status == "partially_filled":
+            _dlog_outcome(st, o["id"], status, fq, avg)
         if status == "filled":
             _cust_log(st, f"✅ {word} filled: {fq:.6g} {o['sym']} at an average ${avg:.2f} (${fq * avg:.2f}).")
         elif status in _TRACK_FINAL:
@@ -5710,6 +5813,7 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None,
                     if conn.get("dry"): _sim_apply(st, sym, qty, "sell", price)
                     st["cooldowns"].setdefault(sym, {})["sell"] = time.time(); st["scale_state"].pop(sym, None)
                     _cust_log(st, pre + f"🛑 {W('Sold', 'Sell submitted:')} {qty} {sym}. It fell {abs(pct):.1f}%, past your {r['maxLossPct']}% stop-loss.")
+                    if LV: _dlog(st, conn, "stop-loss", f"fell {abs(pct):.1f}% (limit {r['maxLossPct']}%)", sym, "sell", qty, price, regime)
                 else:
                     _cust_reject(st, conn, sym, "sell", qty, pre)
                 continue
@@ -5731,6 +5835,7 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None,
                     ss["tiers_hit"][i] = True
                     st["cooldowns"].setdefault(sym, {})["sell"] = time.time()
                     _cust_log(st, pre + f"💰 {W('Sold', 'Sell submitted:')} {sq} {sym} to lock in a gain (+{pct:.1f}%).")
+                    if LV: _dlog(st, conn, "profit-taking", f"tier {i + 1} reached: +{pct:.1f}%", sym, "sell", sq, price, regime)
                 else:
                     _cust_reject(st, conn, sym, "sell", sq, pre)
                 acted = True
@@ -5740,6 +5845,7 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None,
                     if conn.get("dry"): _sim_apply(st, sym, qty, "sell", price)
                     st["cooldowns"].setdefault(sym, {})["sell"] = time.time(); st["scale_state"].pop(sym, None)
                     _cust_log(st, pre + f"💰 {W('Sold', 'Sell submitted:')} the remaining {qty} {sym} at +{pct:.1f}%.")
+                    if LV: _dlog(st, conn, "profit-taking (final)", f"final tier reached: +{pct:.1f}%", sym, "sell", qty, price, regime)
                 else:
                     _cust_reject(st, conn, sym, "sell", qty, pre)
         for s in [s for s in st["scale_state"] if s not in positions]:
@@ -5888,6 +5994,19 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None,
             if _cust_order(conn, sym, order_qty, side, notional=buy_dollars if (frac and side == "buy") else None):
                 if conn.get("dry"): _sim_apply(st, sym, order_qty, side, price)
                 st["cooldowns"].setdefault(sym, {})[side] = time.time()
+                if LV and side == "buy":
+                    _inv = invested if caps else 0
+                    _dlog(st, conn, "buy signal", f"{agreeing} of {total} signals agreed", sym, "buy", (buy_dollars if frac else order_qty), price, regime,
+                          checks=["data fresh: " + str(round(time.time() - float(_cust_shared.get('ts') or 0))) + "s old (limit " + str(round(LIVE_MAX_DATA_AGE)) + "s)",
+                                  "positions and open orders read from Alpaca", "circuit breaker OK", "daily loss limit OK",
+                                  "no cooldown or duplicate order pending",
+                                  "room: invested $" + format(_inv, ".2f") + " of $" + format(caps["max_invested"], "g") + ", per stock cap $" + format(caps["max_position"], "g"),
+                                  "market regime: " + str((regime or {}).get("label") or (regime or {}).get("trend") or "unknown") + (" (bear-test mode)" if bear_test else "")],
+                          signals={"agreeing": agreeing, "total": total, "needed": required,
+                                   "base": [[n, bool(ok)] for n, ok in sig["base"]], "ai": {"confidence": conf, "volatility": vol, "sync": sync}})
+                elif LV:
+                    _dlog(st, conn, "AI sell signal", "AI sell signal after the minimum hold", sym, "sell", order_qty, price, regime,
+                          signals={"ai": {"confidence": conf, "volatility": vol, "sync": sync}})
                 if side == "buy" and cash_acct:
                     st["day_spend"] = round(st.get("day_spend", 0.0) + (buy_dollars if frac else price), 2)
                 if side == "buy" and frac:
@@ -6118,6 +6237,17 @@ def live_engine_loop():
             live_engine["last_error"] = f"{type(e).__name__}: {str(e)[:120]}"
             logger.error(f"live engine error: {live_engine['last_error']}")
         time.sleep(300)
+
+@app.route("/api/live/decisions")
+@require_api_key
+def live_decisions():
+    """Read-only: the live account's decision log (newest first)."""
+    try:
+        uid = _live_state_uid()
+        st = _cust_state_load(uid) if uid else {}
+        return jsonify({"version": RULE_VERSION, "decisions": list(reversed(st.get("decisions", [])))[:60]})
+    except Exception as e:
+        return _safe_err(e)
 
 @app.route("/api/live/status")
 @require_api_key

@@ -4644,10 +4644,24 @@ def _bt_rsi(closes, n=14):
     ag, al = sum(g) / n, sum(l) / n
     return 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
 
+def _bt_ha_red(v, j, n=1):
+    """True if the last n Heikin-Ashi candles ending at index j are all red (HA close below HA open).
+    HA close = (o+h+l+c)/4; HA open = average of the previous HA open and close. Seeded 60 bars back."""
+    lo = max(0, j - 60)
+    ha_o = ha_c = None
+    reds = []
+    for k in range(lo, j + 1):
+        b = v[k]
+        c = (b["o"] + b["h"] + b["l"] + b["c"]) / 4.0
+        o = (b["o"] + b["c"]) / 2.0 if ha_o is None else (ha_o + ha_c) / 2.0
+        ha_o, ha_c = o, c
+        reds.append(c < o)
+    return len(reds) >= n and all(reds[-n:])
+
 def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_invested=250.0,
                  max_position=100.0, max_price=100.0, stop_pct=4.0, max_hold_days=10,
                  daily_loss=10.0, slippage_pct=0.05, use_regime=True, regime_buffer_pct=0.0,
-                 breaker_pct=None, breaker_pause_days=10, min_hold_days=0):
+                 breaker_pct=None, breaker_pause_days=10, min_hold_days=0, ha_exit=0):
     """bars: {symbol: [{'d','o','h','l','c','v'}...]} oldest->newest; must include 'SPY'.
     Signals use data through the close of day t; orders fill at the open of day t+1.
     Returns {'equity': [(date, equity)], 'trades': [...], 'spy': [(date, close)]}. Pure function."""
@@ -4734,7 +4748,8 @@ def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_
             else:
                 sm = _bt_sma(closes, 20)
                 # swing style: the trend-break exit only counts after min_hold_days (stop-loss still works any day)
-                if (sm is not None and closes[-1] < sm and held_days >= min_hold_days) or held_days >= max_hold_days:
+                brk = _bt_ha_red(bars[sym], j, ha_exit) if ha_exit else (sm is not None and closes[-1] < sm)
+                if (brk and held_days >= min_hold_days) or held_days >= max_hold_days:
                     pending_sell.add(sym)
         if not bull or day_pl <= -daily_loss or di < 55 or di < halted_until:
             continue
@@ -5080,6 +5095,32 @@ def backtest_inverse_route():
                         "notes": ["Holding rule uses the S&P's own 20-day average, the same line the engine uses for its market filter.",
                                   "Signals use the close; orders fill at the next day's open with 0.05% slippage per side. Cash earns nothing.",
                                   "SH and PSQ lose value over time in choppy markets; this test counts that. 'S&P' is simply buying and holding SPY over the same dates."]})
+    except Exception as e:
+        return _safe_err(e)
+
+
+@app.route("/api/backtest/ha")
+@require_api_key
+def backtest_ha_route():
+    """Read-only: would selling when Heikin-Ashi candles turn red beat the current trend-break exit? ?v=0..3, one per request."""
+    try:
+        bars = _bt_load_bars(2)
+        if not bars.get("SPY") or len(bars["SPY"]) < 150:
+            return jsonify({"error": "Not enough price history returned"}), 502
+        variants = [
+            ("Current exit: sell when the price closes under its 20-day average (2 of 3 signals buys, 4% stop)", dict(strategy="technical", min_signals=2)),
+            ("Heikin-Ashi exit: sell after 1 red Heikin-Ashi candle", dict(strategy="technical", min_signals=2, ha_exit=1)),
+            ("Heikin-Ashi exit: sell after 2 red candles in a row", dict(strategy="technical", min_signals=2, ha_exit=2)),
+            ("Heikin-Ashi exit: 2 red candles in a row, but not before day 3", dict(strategy="technical", min_signals=2, ha_exit=2, min_hold_days=3)),
+        ]
+        v = request.args.get("v")
+        sel = [variants[int(v)]] if v is not None and 0 <= int(v) < len(variants) else variants
+        reports = [robustness_report(bars, n, **kw) for n, kw in sel]
+        return jsonify({"days": len(bars["SPY"]), "reports": reports,
+                        "notes": ["Only the sell rule changes; the buy rules, 4% stop-loss and 10-day maximum hold are the same in every row.",
+                                  "Heikin-Ashi candles are calculated from averages, so an exit signal comes after the move has started.",
+                                  "Technical rules only; sentiment and AI sells cannot be replayed on past data.",
+                                  "Orders fill at the next day's open with 0.05% slippage per side; cash-account settlement delays are ignored."]})
     except Exception as e:
         return _safe_err(e)
 

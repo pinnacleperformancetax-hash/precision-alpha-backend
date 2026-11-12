@@ -2920,7 +2920,9 @@ def auto_scan():
 
 def engine_loop():
     while engine_state['running']:
-        try: auto_scan()
+        try:
+            auto_scan()
+            engine_state['last_scan_done'] = time.time()      # a scan that ran to the end (health page watches this)
         except Exception as e:
             logger.error(f"Engine error: {e}")
             # Also surface it on the dashboard feed — previously a crashing scan
@@ -5308,6 +5310,7 @@ def _cust_refresh_shared_locked(force=False):
             continue
         time.sleep(0.5)
     _cust_shared["signals"], _cust_shared["regime"], _cust_shared["ts"] = signals, regime, time.time()
+    engine_state["ai_calls"] = int(engine_state.get("ai_calls", 0)) + len(signals)      # rough AI usage counter (one AI check per stock per scan)
 
 def _cust_state_load(uid):
     try:
@@ -6516,6 +6519,105 @@ def seedsim_cycle():
         seedsim_run_cycle(sim, cfg, signals, regime, est, mtc, cutoff)
         seedsim_state["sims"][key] = sim          # swap in the finished copy in one step
     save_state()
+    try:
+        ab_cycle()
+    except Exception as e:
+        logger.error(f"A/B sim error: {type(e).__name__}: {str(e)[:120]}")
+
+# ---------------------------------------------------------------------------
+# /health: for an OUTSIDE monitor (e.g. UptimeRobot). No key needed, reveals nothing sensitive.
+# 200 = fine. 503 = a problem. Outside market hours it is fine as long as the server answers.
+# During market hours the paper engine must have FINISHED a scan within HEALTH_MAX_SCAN_MIN minutes
+# (counted from the open for the first 10 minutes of the day).
+# ---------------------------------------------------------------------------
+HEALTH_MAX_SCAN_MIN = _trail_num("HEALTH_MAX_SCAN_MIN", 10)
+
+@app.route("/health")
+def health_route():
+    now = time.time()
+    out = {"server": "up", "checked_at": datetime.utcnow().isoformat() + "Z"}
+    try:
+        open_now = bool(is_market_hours())
+    except Exception:
+        open_now = False
+    out["market_open"] = open_now
+    if not engine_state.get("running"):
+        out.update(status="ok", message="Server is up. The Auto Engine was stopped by you, so it is not scanning or buying.")
+        return jsonify(out), 200
+    if not open_now:
+        out.update(status="ok", message="Server is up. Market closed, so no scans are expected.")
+        return jsonify(out), 200
+    est = datetime.now(pytz.timezone("America/New_York"))
+    open_ts = now - ((est.hour * 60 + est.minute) - (9 * 60 + 30)) * 60 - est.second
+    last = float(engine_state.get("last_scan_done") or 0)
+    age_min = (now - max(last, open_ts)) / 60.0
+    out["minutes_since_last_finished_scan"] = round(age_min, 1)
+    try:
+        out["live_engine"] = {"paused_new_buys": bool(live_engine.get("paused")), "last_error": live_engine.get("last_error") or ""}
+    except Exception:
+        pass
+    if age_min > HEALTH_MAX_SCAN_MIN:
+        out.update(status="problem", message=(f"The Auto Engine has not finished a scan in {age_min:.0f} minutes (limit {HEALTH_MAX_SCAN_MIN:g}). "
+                   "No new buys are happening, and stops and profit-taking are not being checked by the app until it recovers. "
+                   "Open Render > Logs to see why, or redeploy."))
+        return jsonify(out), 503
+    out.update(status="ok", message="Server is up and the Auto Engine finished a scan recently.")
+    return jsonify(out), 200
+
+# ---------------------------------------------------------------------------
+# AI vs NO-AI experiment (forward test, pretend accounts, no orders). Same start amount, same sizing,
+# stops and profit targets, same stocks, same signals. The only difference: in the "price rules only" account the
+# AI's opinion is neutralised (it always agrees, never says sell), so entries come from the price-based signals alone.
+# ---------------------------------------------------------------------------
+AB_ENABLED = os.environ.get("AB_SIM", "1").strip() != "0"
+AB_START = _live_num("AB_START", 10000)
+AB_CFG = {"label": "A/B", "max_invested": 0.50, "max_position": 0.17, "chunk": 0.083, "max_positions": 6,
+          "stop_pct": 4.0, "tiers": [(5.0, 0.34), (10.0, 0.33)], "final_pct": 15.0, "daily_loss": 0.02}
+AB_NEUTRAL_AI = {"side": "buy", "confidence": 100, "volatility": 0, "sync": 100}
+AB_LABELS = {"ai": "With AI (price rules + AI judgment)", "base": "Price rules only (no AI)"}
+
+def _ab_new(key, today):
+    sim = _seed_new_sim(key, today)
+    for k in ("start", "cash", "peak", "last_eq"):
+        sim[k] = float(AB_START)
+    return sim
+
+def ab_cycle():
+    if not AB_ENABLED or not is_market_hours():
+        return
+    signals, regime = _cust_shared["signals"], _cust_shared["regime"] or {}
+    if not signals or time.time() - _cust_shared["ts"] > 600:
+        return
+    est = datetime.now(pytz.timezone("America/New_York"))
+    mtc = _minutes_to_close(est)
+    cutoff = PAPER_NO_BUY_AFTER_MIN is not None and _paper_buy_cutoff_passed(est=est, cutoff=PAPER_NO_BUY_AFTER_MIN)
+    today = est.strftime("%Y-%m-%d")
+    ab = seedsim_state.setdefault("ab", {})
+    neutral = {sym: dict(sg, ai=dict(AB_NEUTRAL_AI)) for sym, sg in signals.items()}
+    for key, sg in (("ai", signals), ("base", neutral)):
+        sim = _copy.deepcopy(ab.get(key) or _ab_new(key, today))
+        seedsim_run_cycle(sim, AB_CFG, sg, regime, est, mtc, cutoff)
+        ab[key] = sim
+    ab["ai_calls"] = int(engine_state.get("ai_calls", 0))
+    ab.setdefault("started", today)
+    save_state()
+
+@app.route("/api/ab/status")
+@require_api_key
+def ab_status():
+    ab = seedsim_state.get("ab") or {}
+    out = {"enabled": AB_ENABLED, "start": AB_START, "started": ab.get("started"),
+           "question": "Does adding AI judgment improve results compared with the same price-based rules without it?",
+           "note": "Both are pretend accounts run by the app's own simulator, not Alpaca orders, so treat this as a comparison of rules, not of real fills. The first several weeks are observation, not a pass/fail test.",
+           "ai_calls": int(engine_state.get("ai_calls", 0)), "sims": []}
+    for key in ("ai", "base"):
+        sim = ab.get(key)
+        if sim:
+            sm = seedsim_summary(sim, dict(AB_CFG, label=AB_LABELS[key]))
+            inv = sum(q["qty"] * q.get("last", q["avg"]) for q in sim["pos"].values())
+            sm["invested_pct"] = round(inv / sm["equity"] * 100, 1) if sm["equity"] else 0
+            out["sims"].append(sm)
+    return jsonify(out)
 
 def seedsim_loop():
     time.sleep(90)       # start a little after the live engine so they share one AI scan

@@ -5335,6 +5335,11 @@ def _cust_order(conn, sym, qty, side, notional=None):
         r = requests.post(f"{conn['base']}/orders", headers=conn["hdrs"], timeout=10, json=body)
         if r.ok:
             conn["last_err"] = None
+            try:      # remember the order id so the feed can later confirm what Alpaca really did with it
+                conn.setdefault("placed", []).append({"id": (r.json() or {}).get("id"), "sym": sym, "side": side,
+                                                      "qty": body.get("qty"), "notional": body.get("notional"), "t": time.time()})
+            except Exception:
+                pass
             return True
         try:
             why = (r.json() or {}).get("message") or r.text[:120]
@@ -5343,8 +5348,53 @@ def _cust_order(conn, sym, qty, side, notional=None):
         conn["last_err"] = f"Alpaca said no ({r.status_code}): {str(why)[:120]}"
         return False
     except Exception as e:
-        conn["last_err"] = f"Could not reach Alpaca ({type(e).__name__})"
+        conn["last_err"] = f"Could not confirm with Alpaca ({type(e).__name__}). The order may or may not have gone through; the engine checks Alpaca's open orders and positions before trying again."
         return False
+
+_TRACK_FINAL = {"filled", "canceled", "expired", "rejected", "done_for_day", "replaced", "stopped", "suspended"}
+
+def _track_orders(st, conn):
+    """Live account: confirm what Alpaca actually did with each submitted order, and say so in the feed."""
+    placed = conn.pop("placed", [])
+    tr = st.setdefault("tracked", [])
+    tr.extend(x for x in placed if x.get("id"))
+    keep = []
+    for o in tr:
+        word = "Buy" if o["side"] == "buy" else "Sell"
+        if time.time() - o["t"] > 3 * 86400:
+            _cust_log(st, f"❓ Could not confirm the final status of the {word.lower()} order for {o['sym']} after 3 days. Check Alpaca.")
+            continue
+        try:
+            r = requests.get(f"{conn['base']}/orders/{o['id']}", headers=conn["hdrs"], timeout=10)
+            if not r.ok:
+                keep.append(o)
+                continue
+            j = r.json()
+        except Exception:
+            keep.append(o)
+            continue
+        status, fq = j.get("status"), float(j.get("filled_qty") or 0)
+        avg = float(j.get("filled_avg_price") or 0)
+        if status == "filled":
+            _cust_log(st, f"✅ {word} filled: {fq:.6g} {o['sym']} at an average ${avg:.2f} (${fq * avg:.2f}).")
+        elif status in _TRACK_FINAL:
+            if fq > 0:
+                _cust_log(st, f"⚠️ {word} order for {o['sym']} ended as {status} after {fq:.6g} shares filled at ${avg:.2f}. The rest was not done.")
+            else:
+                _cust_log(st, f"❌ {word} order for {o['sym']} was {status}. Nothing was {'bought' if o['side'] == 'buy' else 'sold'}.")
+        else:
+            if status == "partially_filled" and o.get("pf") != fq:
+                o["pf"] = fq
+                _cust_log(st, f"⏳ {word} partly filled: {fq:.6g} {o['sym']} so far at ${avg:.2f}.")
+            keep.append(o)
+    st["tracked"] = keep[-60:]
+
+def _gate_note(st, key, msg, minutes=30):
+    """Say why a buy was blocked, at most once per `minutes` per reason, so the feed stays readable."""
+    gn = st.setdefault("gate_notes", {})
+    if time.time() - float(gn.get(key) or 0) >= minutes * 60:
+        gn[key] = time.time()
+        _cust_log(st, msg)
 
 def _cust_reject(st, conn, sym, side, qty, pre=""):
     """An order Alpaca refused: say so in the feed and cool the stock down so the same refusal is not
@@ -5425,6 +5475,7 @@ def _sim_summary(st):
 # ===========================================================================
 import hmac as _hmac, hashlib as _hashlib, secrets as _secrets, html as _html
 from flask import Response as _Resp
+LIVE_MAX_DATA_AGE = float(os.environ.get("LIVE_MAX_DATA_AGE", "").strip() or 900)   # seconds; older market data blocks new live buys
 LIVE_APPROVAL = os.environ.get("LIVE_APPROVAL", "").strip() == "1"
 LIVE_APPROVAL_MIN = float(os.environ.get("LIVE_APPROVAL_MIN", "").strip() or 50)
 LIVE_APPROVAL_MINUTES = float(os.environ.get("LIVE_APPROVAL_MINUTES", "").strip() or 30)
@@ -5571,11 +5622,14 @@ def approve_route(pid):
         _appr_log(f"⚠️ Approved buy of {it['sym']} did not go through: {msg}")
     return _appr_page("Approved" if ok else "Not bought", _html.escape(msg))
 
-def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None):
-    """One pass for one customer on their own paper account."""
+def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None, no_new_buys=False):
+    """One pass for one customer on their own paper account. no_new_buys=True (live Pause): sells, stops and exits still run."""
     r, offset = _cust_rules(level)
     conn = conn or _cust_conn(token)
     H = conn["hdrs"]
+    LV = bool(caps) and not conn.get("dry")        # live account: wording says "submitted" until Alpaca confirms the fill
+    def W(done, sub):
+        return sub if LV else done
     pre = "(practice run, no order sent) " if conn.get("dry") else ""
     if caps:   # extra hard limits for the owner's live-money account
         r["maxDailyLoss"] = min(r["maxDailyLoss"], caps["max_daily_loss"])
@@ -5599,6 +5653,8 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                 _cust_revoke(uid)
             return
         if not ar.ok:
+            if caps:
+                _gate_note(st, "acct", f"⚠️ Could not read your Alpaca account (HTTP {ar.status_code}), so nothing was traded this cycle.")
             return
         acct = ar.json()
         blocked = bool(acct.get("trading_blocked") or acct.get("account_blocked"))
@@ -5619,6 +5675,8 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
         pr = requests.get(f"{conn['base']}/positions", headers=H, timeout=10)
         orr = requests.get(f"{conn['base']}/orders?status=open&limit=200", headers=H, timeout=10)
         if not pr.ok or not orr.ok:
+            if caps:
+                _gate_note(st, "pos", "⚠️ Could not confirm your current Alpaca positions and open orders, so nothing was traded this cycle (no buys, sells or stops).")
             return
         positions = {p["symbol"]: p for p in pr.json()}
         if conn.get("dry"):
@@ -5651,7 +5709,7 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                 if _cust_order(conn, sym, qty, "sell"):
                     if conn.get("dry"): _sim_apply(st, sym, qty, "sell", price)
                     st["cooldowns"].setdefault(sym, {})["sell"] = time.time(); st["scale_state"].pop(sym, None)
-                    _cust_log(st, pre + f"🛑 Sold {qty} {sym}. It fell {abs(pct):.1f}%, past your {r['maxLossPct']}% stop-loss.")
+                    _cust_log(st, pre + f"🛑 {W('Sold', 'Sell submitted:')} {qty} {sym}. It fell {abs(pct):.1f}%, past your {r['maxLossPct']}% stop-loss.")
                 else:
                     _cust_reject(st, conn, sym, "sell", qty, pre)
                 continue
@@ -5672,7 +5730,7 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                     if conn.get("dry"): _sim_apply(st, sym, sq, "sell", price)
                     ss["tiers_hit"][i] = True
                     st["cooldowns"].setdefault(sym, {})["sell"] = time.time()
-                    _cust_log(st, pre + f"💰 Sold {sq} {sym} to lock in a gain (+{pct:.1f}%).")
+                    _cust_log(st, pre + f"💰 {W('Sold', 'Sell submitted:')} {sq} {sym} to lock in a gain (+{pct:.1f}%).")
                 else:
                     _cust_reject(st, conn, sym, "sell", sq, pre)
                 acted = True
@@ -5681,7 +5739,7 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                 if _cust_order(conn, sym, qty, "sell"):
                     if conn.get("dry"): _sim_apply(st, sym, qty, "sell", price)
                     st["cooldowns"].setdefault(sym, {})["sell"] = time.time(); st["scale_state"].pop(sym, None)
-                    _cust_log(st, pre + f"💰 Sold the remaining {qty} {sym} at +{pct:.1f}%.")
+                    _cust_log(st, pre + f"💰 {W('Sold', 'Sell submitted:')} the remaining {qty} {sym} at +{pct:.1f}%.")
                 else:
                     _cust_reject(st, conn, sym, "sell", qty, pre)
         for s in [s for s in st["scale_state"] if s not in positions]:
@@ -5706,6 +5764,15 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
             st["breaker"] = br
             if br.get("tripped"):
                 limit_hit = True
+        block_buys = False
+        if caps:
+            age = time.time() - float(_cust_shared.get("ts") or 0)
+            if no_new_buys:
+                block_buys = True
+                _gate_note(st, "paused", "⏸ New buys are paused. Stops, profit-taking and AI sells keep managing your open positions.", minutes=240)
+            elif age > LIVE_MAX_DATA_AGE:
+                block_buys = True
+                _gate_note(st, "stale", f"⛔ Buy skipped: market data is {age / 60:.0f} minutes old (limit {LIVE_MAX_DATA_AGE / 60:.0f}). Sells and stops still run.")
         if limit_hit and not st.get("limit_logged"):
             st["limit_logged"] = True
             _cust_log(st, pre + f"🔴 Daily loss limit reached (${day_pl:.2f}). No new buys today. Selling to protect gains stays active.")
@@ -5723,7 +5790,9 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                 continue
             buy_dollars = None
             if side == "buy":
-                if limit_hit:
+                if limit_hit or block_buys:
+                    continue
+                if not price or price <= 0:
                     continue
                 required, out_of = _cust_conf_required(regime, offset)
                 bear_test = False
@@ -5822,19 +5891,24 @@ def run_customer_cycle(uid, token, level, regime, signals, conn=None, caps=None)
                 if side == "buy" and cash_acct:
                     st["day_spend"] = round(st.get("day_spend", 0.0) + (buy_dollars if frac else price), 2)
                 if side == "buy" and frac:
-                    _cust_log(st, pre + f"🟢 Bought ${buy_dollars:.2f} of {sym} (about {order_qty:.4f} shares at ${price:.2f}). {agreeing} of {total} signals agreed.")
+                    _cust_log(st, pre + f"🟢 {W('Bought', 'Buy submitted:')} ${buy_dollars:.2f} of {sym} (about {order_qty:.4f} shares at ${price:.2f}). {agreeing} of {total} signals agreed.")
                 elif side == "buy":
-                    _cust_log(st, pre + f"🟢 Bought 1 {sym} at about ${price:.2f}. {agreeing} of {total} signals agreed.")
+                    _cust_log(st, pre + f"🟢 {W('Bought', 'Buy submitted:')} 1 {sym} at about ${price:.2f}. {agreeing} of {total} signals agreed.")
                 elif frac:
-                    _cust_log(st, pre + f"🔴 Sold all {order_qty:.4f} {sym} at about ${price:.2f} on an AI sell signal.")
+                    _cust_log(st, pre + f"🔴 {W('Sold', 'Sell submitted:')} all {order_qty:.4f} {sym} at about ${price:.2f} on an AI sell signal.")
                 else:
-                    _cust_log(st, pre + f"🔴 Sold 1 {sym} at about ${price:.2f} on an AI sell signal.")
+                    _cust_log(st, pre + f"🔴 {W('Sold', 'Sell submitted:')} 1 {sym} at about ${price:.2f} on an AI sell signal.")
             else:
                 _cust_reject(st, conn, sym, side, order_qty, pre)
             break
     except Exception as e:
         logger.error(f"customer cycle failed for {uid}: {type(e).__name__}: {str(e)[:120]}")
     finally:
+        if caps and not conn.get("dry"):
+            try:
+                _track_orders(st, conn)
+            except Exception as e:
+                logger.error(f"order tracking failed: {type(e).__name__}: {str(e)[:100]}")
         _cust_state_save(uid, st)
 
 def customer_engine_cycle():
@@ -6022,7 +6096,8 @@ def _live_state_uid():
     return _live_uid["v"]
 
 def live_engine_cycle():
-    if live_engine["paused"] or not _live_ready() or not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+    # Pause now means "no new buys": the cycle still runs so stops, profit-taking and AI sells keep managing open positions.
+    if not _live_ready() or not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
         return
     if not is_market_hours():
         return
@@ -6031,7 +6106,7 @@ def live_engine_cycle():
         live_engine["last_error"] = "Owner profile not found, live engine idle."
         return
     _cust_refresh_shared()
-    run_customer_cycle(uid, None, LIVE_RISK, _cust_shared["regime"] or {}, _cust_shared["signals"], conn=live_conn(), caps=LIVE_CAPS)
+    run_customer_cycle(uid, None, LIVE_RISK, _cust_shared["regime"] or {}, _cust_shared["signals"], conn=live_conn(), caps=LIVE_CAPS, no_new_buys=live_engine["paused"])
     live_engine["last_cycle"] = datetime.utcnow().isoformat() + "Z"
 
 def live_engine_loop():

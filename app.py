@@ -6640,7 +6640,50 @@ AB_START = _live_num("AB_START", 10000)
 AB_CFG = {"label": "A/B", "max_invested": 0.50, "max_position": 0.17, "chunk": 0.083, "max_positions": 6,
           "stop_pct": 4.0, "tiers": [(5.0, 0.34), (10.0, 0.33)], "final_pct": 15.0, "daily_loss": 0.02}
 AB_NEUTRAL_AI = {"side": "buy", "confidence": 100, "volatility": 0, "sync": 100}
-AB_LABELS = {"ai": "With AI (price rules + AI judgment)", "base": "Price rules only (no AI)"}
+AB_LABELS = {"ai": "With AI (price rules + AI judgment)", "base": "Price rules only (no AI)",
+             "ha": "Price rules + Heikin-Ashi exit (no AI): sells after 1 red daily Heikin-Ashi candle"}
+AB_HA_ENABLED = os.environ.get("AB_HA", "1").strip() != "0"
+_ab_bars_cache = {}      # symbol -> (date it was fetched, completed daily bars)
+
+def _ab_daily_bars(sym, today):
+    """Completed daily bars (today's unfinished bar excluded), cached once per day. None if the download fails."""
+    c = _ab_bars_cache.get(sym)
+    if c and c[0] == today:
+        return c[1]
+    try:
+        start = (datetime.utcnow() - timedelta(days=140)).strftime("%Y-%m-%dT00:00:00Z")
+        r = requests.get(f"{ALPACA_DATA_URL}/stocks/{sym}/bars", headers=alpaca_hdrs(), timeout=15,
+                         params={"timeframe": "1Day", "start": start, "limit": 200, "feed": "iex", "adjustment": "split"})
+        if not r.ok:
+            return None
+        bars = [{"d": b["t"][:10], "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b["v"]}
+                for b in r.json().get("bars", []) if b["t"][:10] < today]
+        if len(bars) < 5:
+            return None
+        _ab_bars_cache[sym] = (today, bars)
+        return bars
+    except Exception as e:
+        logger.warning(f"A/B Heikin-Ashi bars {sym}: {e}")
+        return None
+
+def _ab_ha_exits(sim, est, now_ts):
+    """Sell a holding when the last COMPLETED daily Heikin-Ashi candle is red. Same timing as the backtest: the signal comes from
+    a finished day and the order goes out the next trading day. Only positions bought on an earlier day are checked.
+    If the price history can't be downloaded the position is simply kept (the stop and profit targets still work)."""
+    today = est.strftime("%Y-%m-%d")
+    et = pytz.timezone("America/New_York")
+    for sym in list(sim["pos"].keys()):
+        p = sim["pos"][sym]
+        price = p.get("last") or 0
+        if price <= 0 or p["qty"] <= 0:
+            continue
+        if datetime.fromtimestamp(p.get("bought_at", now_ts), et).strftime("%Y-%m-%d") >= today:
+            continue
+        bars = _ab_daily_bars(sym, today)
+        if not bars:
+            continue
+        if _bt_ha_red(bars, len(bars) - 1, 1):
+            _seed_sell(sim, sym, p["qty"], price, est, now_ts, "Heikin-Ashi candle turned red")
 
 def _ab_new(key, today):
     sim = _seed_new_sim(key, today)
@@ -6660,9 +6703,16 @@ def ab_cycle():
     today = est.strftime("%Y-%m-%d")
     ab = seedsim_state.setdefault("ab", {})
     neutral = {sym: dict(sg, ai=dict(AB_NEUTRAL_AI)) for sym, sg in signals.items()}
-    for key, sg in (("ai", signals), ("base", neutral)):
-        sim = _copy.deepcopy(ab.get(key) or _ab_new(key, today))
+    keys = [("ai", signals), ("base", neutral)] + ([("ha", neutral)] if AB_HA_ENABLED else [])
+    for key, sg in keys:
+        if key == "ha" and not ab.get("ha") and ab.get("base"):
+            sim = _copy.deepcopy(ab["base"])      # starts as an exact copy of the no-AI account so the comparison has one difference
+            sim["key"] = "ha"
+        else:
+            sim = _copy.deepcopy(ab.get(key) or _ab_new(key, today))
         seedsim_run_cycle(sim, AB_CFG, sg, regime, est, mtc, cutoff)
+        if key == "ha":
+            _ab_ha_exits(sim, est, time.time())
         ab[key] = sim
     ab["ai_calls"] = int(engine_state.get("ai_calls", 0))
     ab.setdefault("started", today)
@@ -6673,10 +6723,10 @@ def ab_cycle():
 def ab_status():
     ab = seedsim_state.get("ab") or {}
     out = {"enabled": AB_ENABLED, "start": AB_START, "started": ab.get("started"),
-           "question": "Does adding AI judgment improve results compared with the same price-based rules without it?",
+           "question": "Does adding AI judgment improve results compared with the same price-based rules without it? And does selling after a red Heikin-Ashi candle (third account) smooth the ride compared with the no-AI account?",
            "note": "Both are pretend accounts run by the app's own simulator, not Alpaca orders, so treat this as a comparison of rules, not of real fills. The first several weeks are observation, not a pass/fail test.",
            "ai_calls": int(engine_state.get("ai_calls", 0)), "sims": []}
-    for key in ("ai", "base"):
+    for key in ("ai", "base", "ha"):
         sim = ab.get(key)
         if sim:
             sm = seedsim_summary(sim, dict(AB_CFG, label=AB_LABELS[key]))

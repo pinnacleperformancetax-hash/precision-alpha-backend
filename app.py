@@ -4680,9 +4680,13 @@ def _bt_ha_red(v, j, n=1):
 def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_invested=250.0,
                  max_position=100.0, max_price=100.0, stop_pct=4.0, max_hold_days=10,
                  daily_loss=10.0, slippage_pct=0.05, use_regime=True, regime_buffer_pct=0.0,
-                 breaker_pct=None, breaker_pause_days=10, min_hold_days=0, ha_exit=0):
+                 breaker_pct=None, breaker_pause_days=10, min_hold_days=0, ha_exit=0,
+                 shorts=False, short_below_pct=0.0):
     """bars: {symbol: [{'d','o','h','l','c','v'}...]} oldest->newest; must include 'SPY'.
     Signals use data through the close of day t; orders fill at the open of day t+1.
+    shorts=True mirrors the rules for selling short: it only opens shorts while the S&P is at least short_below_pct under its
+    20-day average, uses the mirrored signals (price under its 20-day average, RSI 30-60, high volume), covers when the price
+    closes back above its 20-day average, and the stop-loss sits above the entry. Borrow fees are not modelled.
     Returns {'equity': [(date, equity)], 'trades': [...], 'spy': [(date, close)]}. Pure function."""
     spy = bars.get("SPY") or []
     dates = [b["d"] for b in spy]
@@ -4697,23 +4701,30 @@ def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_
         for sym in list(pending_sell):
             if sym in held and d in idx.get(sym, {}):
                 b = bars[sym][idx[sym][d]]
-                px = b["o"] * (1 - slip)
                 pos = held.pop(sym)
-                cash += pos["qty"] * px
+                if pos.get("short"):
+                    px = b["o"] * (1 + slip)          # buy to cover
+                    cash -= pos["qty"] * px
+                else:
+                    px = b["o"] * (1 - slip)
+                    cash += pos["qty"] * px
                 trades.append({"symbol": sym, "qty": pos["qty"], "entry": pos["entry"], "exit": px,
-                               "entry_d": pos["d"], "exit_d": d, "why": "signal"})
+                               "entry_d": pos["d"], "exit_d": d, "why": "signal", "short": bool(pos.get("short"))})
         pending_sell = set()
         for sym in pending_buy:
             if sym in held or d not in idx.get(sym, {}):
                 continue
             b = bars[sym][idx[sym][d]]
-            px = b["o"] * (1 + slip)
+            px = b["o"] * ((1 - slip) if shorts else (1 + slip))
             invested = sum(p["qty"] * p["entry"] for p in held.values())
             budget = min(max_position, max_invested - invested, cash)
             qty = int(budget // px) if px > 0 else 0
             if qty >= 1 and px <= max_price * 1.05:
-                cash -= qty * px
-                held[sym] = {"qty": qty, "entry": px, "d": d, "i": di}
+                if shorts:
+                    cash += qty * px                  # short sale proceeds
+                else:
+                    cash -= qty * px
+                held[sym] = {"qty": qty, "entry": px, "d": d, "i": di, "short": bool(shorts)}
         pending_buy = []
         # 2. stop-loss during the day
         for sym in list(held):
@@ -4721,24 +4732,37 @@ def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_
                 continue
             b = bars[sym][idx[sym][d]]
             pos = held[sym]
-            stop = pos["entry"] * (1 - stop_pct / 100.0)
-            if b["o"] <= stop:
-                px = b["o"]
-            elif b["l"] <= stop:
-                px = stop
+            if pos.get("short"):
+                stop = pos["entry"] * (1 + stop_pct / 100.0)
+                if b["o"] >= stop:
+                    px = b["o"]
+                elif b["h"] >= stop:
+                    px = stop
+                else:
+                    continue
+                held.pop(sym)
+                cash -= pos["qty"] * px
             else:
-                continue
-            held.pop(sym)
-            cash += pos["qty"] * px
+                stop = pos["entry"] * (1 - stop_pct / 100.0)
+                if b["o"] <= stop:
+                    px = b["o"]
+                elif b["l"] <= stop:
+                    px = stop
+                else:
+                    continue
+                held.pop(sym)
+                cash += pos["qty"] * px
             trades.append({"symbol": sym, "qty": pos["qty"], "entry": pos["entry"], "exit": px,
-                           "entry_d": pos["d"], "exit_d": d, "why": "stop"})
+                           "entry_d": pos["d"], "exit_d": d, "why": "stop", "short": bool(pos.get("short"))})
         # 3. mark to market at the close
-        eq = cash
+        eq, gross = cash, 0.0
         for sym, pos in held.items():
             j = idx.get(sym, {}).get(d)
-            eq += pos["qty"] * (bars[sym][j]["c"] if j is not None else pos["entry"])
+            mv = pos["qty"] * (bars[sym][j]["c"] if j is not None else pos["entry"])
+            gross += mv
+            eq += -mv if pos.get("short") else mv
         equity.append((d, eq))
-        exposure.append((d, eq - cash))
+        exposure.append((d, gross))
         day_pl = eq - prev_eq
         prev_eq = eq
         if breaker_pct and di >= halted_until:
@@ -4767,10 +4791,17 @@ def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_
             else:
                 sm = _bt_sma(closes, 20)
                 # swing style: the trend-break exit only counts after min_hold_days (stop-loss still works any day)
-                brk = _bt_ha_red(bars[sym], j, ha_exit) if ha_exit else (sm is not None and closes[-1] < sm)
+                if pos.get("short"):
+                    brk = sm is not None and closes[-1] > sm       # price back above its 20-day average: cover
+                else:
+                    brk = _bt_ha_red(bars[sym], j, ha_exit) if ha_exit else (sm is not None and closes[-1] < sm)
                 if (brk and held_days >= min_hold_days) or held_days >= max_hold_days:
                     pending_sell.add(sym)
-        if not bull or day_pl <= -daily_loss or di < 55 or di < halted_until:
+        if shorts:
+            allowed = sma_spy is not None and spy_closes[-1] < sma_spy * (1 - short_below_pct / 100.0)
+        else:
+            allowed = bull
+        if not allowed or day_pl <= -daily_loss or di < 55 or di < halted_until:
             continue
         cands = []
         for sym, v in bars.items():
@@ -4791,9 +4822,14 @@ def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_
                     cands.append((r, sym))
             else:
                 av = _bt_sma(vols[:-1], 20)
-                sig = [price > sm20 if sm20 else False,
-                       r is not None and 40 <= r <= 70,
-                       bool(av) and vols[-1] > 1.2 * av]
+                if shorts:
+                    sig = [price < sm20 if sm20 else False,
+                           r is not None and 30 <= r <= 60,
+                           bool(av) and vols[-1] > 1.2 * av]
+                else:
+                    sig = [price > sm20 if sm20 else False,
+                           r is not None and 40 <= r <= 70,
+                           bool(av) and vols[-1] > 1.2 * av]
                 n = sum(sig)
                 if n >= min_signals:
                     cands.append((-n, sym))
@@ -4828,8 +4864,11 @@ def summarize_backtest(res, split_frac=0.7):
 def _fills_for_trades(trs):
     f = []
     for t in trs:
-        f.append({"symbol": t["symbol"], "side": "buy", "qty": t["qty"], "price": t["entry"], "time": t["entry_d"] + "T14:30:00Z"})
-        f.append({"symbol": t["symbol"], "side": "sell", "qty": t["qty"], "price": t["exit"], "time": t["exit_d"] + "T14:31:00Z"})
+        # A short trade earns entry - exit. The scorecard works on buy-then-sell pairs, so for shorts the prices are swapped
+        # (the scorecard sees buy at the cover price, sell at the short price): same profit, same dates, same hold time.
+        b_px, s_px = (t["exit"], t["entry"]) if t.get("short") else (t["entry"], t["exit"])
+        f.append({"symbol": t["symbol"], "side": "buy", "qty": t["qty"], "price": b_px, "time": t["entry_d"] + "T14:30:00Z"})
+        f.append({"symbol": t["symbol"], "side": "sell", "qty": t["qty"], "price": s_px, "time": t["exit_d"] + "T14:31:00Z"})
     f.sort(key=lambda x: x["time"])
     return f
 
@@ -5140,6 +5179,33 @@ def backtest_ha_route():
                                   "Heikin-Ashi candles are calculated from averages, so an exit signal comes after the move has started.",
                                   "Technical rules only; sentiment and AI sells cannot be replayed on past data.",
                                   "Orders fill at the next day's open with 0.05% slippage per side; cash-account settlement delays are ignored."]})
+    except Exception as e:
+        return _safe_err(e)
+
+
+@app.route("/api/backtest/short")
+@require_api_key
+def backtest_short_route():
+    """Read-only: would the mirrored rules, selling short while the S&P is below its 20-day average, have made money? ?v=0..3, one per request.
+    Paper research only: sends no orders, and your live account is a cash account that cannot short."""
+    try:
+        bars = _bt_load_bars(2)
+        if not bars.get("SPY") or len(bars["SPY"]) < 150:
+            return jsonify({"error": "Not enough price history returned"}), 502
+        variants = [
+            ("A: short when the S&P is under its 20-day average; 2 of 3 mirrored signals; cover when the price closes back above its 20-day average; 4% stop", dict(strategy="technical", min_signals=2, shorts=True)),
+            ("B: same, but all 3 mirrored signals must agree", dict(strategy="technical", min_signals=3, shorts=True)),
+            ("C: only short in a real sell-off (S&P at least 3% under its 20-day average), 2 of 3 signals", dict(strategy="technical", min_signals=2, shorts=True, short_below_pct=3.0)),
+            ("D: same as A with a wider 7% stop above the entry", dict(strategy="technical", min_signals=2, shorts=True, stop_pct=7.0)),
+        ]
+        v = request.args.get("v")
+        sel = [variants[int(v)]] if v is not None and 0 <= int(v) < len(variants) else variants
+        reports = [robustness_report(bars, n, **kw) for n, kw in sel]
+        return jsonify({"days": len(bars["SPY"]), "reports": reports,
+                        "notes": ["Shorts are only opened while the S&P is below its 20-day average. In an up-trending market these rules would do nothing, so the result reflects only the down periods in the data.",
+                                  "Signals mirror the buy side: price under its 20-day average, RSI between 30 and 60, volume above 1.2x average. Sentiment and AI cannot be replayed on past data.",
+                                  "Orders fill at the next day's open with 0.05% slippage per side. Borrow fees, hard-to-borrow stocks and margin interest are NOT modelled, so real results would be lower.",
+                                  "Your live account is a cash account and cannot sell short. This is research for the paper account only."]})
     except Exception as e:
         return _safe_err(e)
 

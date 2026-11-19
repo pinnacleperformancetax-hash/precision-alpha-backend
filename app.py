@@ -4681,12 +4681,13 @@ def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_
                  max_position=100.0, max_price=100.0, stop_pct=4.0, max_hold_days=10,
                  daily_loss=10.0, slippage_pct=0.05, use_regime=True, regime_buffer_pct=0.0,
                  breaker_pct=None, breaker_pause_days=10, min_hold_days=0, ha_exit=0,
-                 shorts=False, short_below_pct=0.0):
+                 shorts=False, short_below_pct=0.0, bear_frac=0.0, bear_min_signals=3):
     """bars: {symbol: [{'d','o','h','l','c','v'}...]} oldest->newest; must include 'SPY'.
     Signals use data through the close of day t; orders fill at the open of day t+1.
     shorts=True mirrors the rules for selling short: it only opens shorts while the S&P is at least short_below_pct under its
     20-day average, uses the mirrored signals (price under its 20-day average, RSI 30-60, high volume), covers when the price
     closes back above its 20-day average, and the stop-loss sits above the entry. Borrow fees are not modelled.
+    bear_frac > 0 lets it buy while the S&P is under its 20-day average at that fraction of normal size, and only when bear_min_signals agree.
     Returns {'equity': [(date, equity)], 'trades': [...], 'spy': [(date, close)]}. Pure function."""
     spy = bars.get("SPY") or []
     dates = [b["d"] for b in spy]
@@ -4696,6 +4697,7 @@ def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_
     slip = slippage_pct / 100.0
     prev_eq = capital
     peak, halted_until, trips = float(capital), -1, 0
+    buy_scale = 1.0
     for di, d in enumerate(dates):
         # 1. fills at today's open (orders queued yesterday)
         for sym in list(pending_sell):
@@ -4717,7 +4719,7 @@ def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_
             b = bars[sym][idx[sym][d]]
             px = b["o"] * ((1 - slip) if shorts else (1 + slip))
             invested = sum(p["qty"] * p["entry"] for p in held.values())
-            budget = min(max_position, max_invested - invested, cash)
+            budget = min(max_position * buy_scale, max_invested - invested, cash)
             qty = int(budget // px) if px > 0 else 0
             if qty >= 1 and px <= max_price * 1.05:
                 if shorts:
@@ -4800,7 +4802,9 @@ def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_
         if shorts:
             allowed = sma_spy is not None and spy_closes[-1] < sma_spy * (1 - short_below_pct / 100.0)
         else:
-            allowed = bull
+            allowed = bull or bear_frac > 0
+        buy_scale = 1.0 if (bull or shorts) else bear_frac
+        need = min_signals if (bull or shorts) else max(min_signals, bear_min_signals)
         if not allowed or day_pl <= -daily_loss or di < 55 or di < halted_until:
             continue
         cands = []
@@ -4831,7 +4835,7 @@ def run_backtest(bars, strategy="technical", min_signals=3, capital=1000.0, max_
                            r is not None and 40 <= r <= 70,
                            bool(av) and vols[-1] > 1.2 * av]
                 n = sum(sig)
-                if n >= min_signals:
+                if n >= need:
                     cands.append((-n, sym))
         cands.sort()
         invested = sum(p["qty"] * p["entry"] for p in held.values())
@@ -5179,6 +5183,33 @@ def backtest_ha_route():
                                   "Heikin-Ashi candles are calculated from averages, so an exit signal comes after the move has started.",
                                   "Technical rules only; sentiment and AI sells cannot be replayed on past data.",
                                   "Orders fill at the next day's open with 0.05% slippage per side; cash-account settlement delays are ignored."]})
+    except Exception as e:
+        return _safe_err(e)
+
+
+@app.route("/api/backtest/moves")
+@require_api_key
+def backtest_moves_route():
+    """Read-only: does trading more (looser entry bar, small buys in a down-market) beat the current rules? ?v=0..3, one per request.
+    Research only: sends no orders and changes no settings."""
+    try:
+        bars = _bt_load_bars(2)
+        if not bars.get("SPY") or len(bars["SPY"]) < 150:
+            return jsonify({"error": "Not enough price history returned"}), 502
+        variants = [
+            ("A: today's rules (all 3 signals, no buying while the S&P is under its 20-day average)", dict(strategy="technical", min_signals=3)),
+            ("B: looser entry bar (2 of 3 signals), still no buying in a down market", dict(strategy="technical", min_signals=2)),
+            ("C: today's entry bar, plus half-size buys in a down market when all 3 signals agree", dict(strategy="technical", min_signals=3, bear_frac=0.5, bear_min_signals=3)),
+            ("D: B and C together (2 of 3 signals in an up market, half-size buys in a down market when all 3 agree)", dict(strategy="technical", min_signals=2, bear_frac=0.5, bear_min_signals=3)),
+        ]
+        v = request.args.get("v")
+        sel = [variants[int(v)]] if v is not None and 0 <= int(v) < len(variants) else variants
+        reports = [robustness_report(bars, n, **kw) for n, kw in sel]
+        return jsonify({"days": len(bars["SPY"]), "reports": reports,
+                        "pass_line": {"profit_factor": 1.3, "max_drawdown_pct": 8.0, "must_beat": "S&P buy-and-hold over the same days"},
+                        "notes": ["Technical rules only (trend, momentum, volume). Sentiment and AI signals cannot be replayed on past data, so this tests the gates, not the whole app.",
+                                  "Orders fill at the next day's open with 0.05% slippage per side.",
+                                  "A variant only counts if it passes on both the first 70% and the last 30% of the history, not just overall."]})
     except Exception as e:
         return _safe_err(e)
 
@@ -6786,9 +6817,13 @@ def ensure_background_threads():
         engine_state['running'] = True
         threading.Thread(target=engine_loop, daemon=True).start()
         log_scan("🚀 Auto engine started on server boot")
-        congress_state['running'] = True
-        threading.Thread(target=congress_loop, daemon=True).start()
-        log_congress("🏛️ Congressional copy engine started on server boot")
+        if os.environ.get("CONGRESS_COPY", "1").strip().lower() in ("0", "off", "false", "no"):
+            congress_state['running'] = False
+            log_congress("🏛️ Congressional copy engine is OFF (CONGRESS_COPY=0)")
+        else:
+            congress_state['running'] = True
+            threading.Thread(target=congress_loop, daemon=True).start()
+            log_congress("🏛️ Congressional copy engine started on server boot")
         # Runs independently of engine on/off state — always checking for Saturday.
         threading.Thread(target=weekly_email_loop, daemon=True).start()
         # Customer engine: only exists when CUSTOMER_ENGINE=1. Otherwise nothing runs.

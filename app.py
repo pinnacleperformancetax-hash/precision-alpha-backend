@@ -6418,7 +6418,7 @@ def live_breaker_reset():
 import copy as _copy
 SEEDSIM_ENABLED = os.environ.get("SEEDSIM", "1").strip() != "0"
 SEEDSIM_START = _live_num("SEEDSIM_START", 300)
-SEEDSIM_MIN_HOLD_MINUTES = 120      # same as the live account: no AI sell for 2 hours after a buy
+SEEDSIM_MIN_HOLD_MINUTES = _live_num("SEEDSIM_MIN_HOLD_MINUTES", 4320)   # no AI sell for 3 days after a buy (stop-loss still works any time); set the env var to change it
 SEEDSIM_COOLDOWN_MINUTES = 30       # same spacing as the other engines
 SEEDSIM_NO_BUY_LAST_MINUTES = 60    # same near-close cutoff as live
 SEEDSIM_DANGLE_DAYS = 30            # judged after this many trading days
